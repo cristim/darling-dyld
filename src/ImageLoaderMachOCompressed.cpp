@@ -1287,8 +1287,10 @@ void ImageLoaderMachOCompressed::eachBind(const LinkContext& context, bind_handl
 				case BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM:
 					symbolName = (char*)p;
 					symboFlags = immediate;
-					while (*p != '\0')
+					while ( (p < end) && (*p != '\0') )
 						++p;
+					if ( p == end )
+						dyld::throwf("malformed binding opcodes: symbol name extends past end of opcodes");
 					++p;
 					break;
 				case BIND_OPCODE_SET_TYPE_IMM:
@@ -1497,8 +1499,10 @@ void ImageLoaderMachOCompressed::eachLazyBind(const LinkContext& context, bind_h
 				case BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM:
 					symbolName = (char*)p;
 					symboFlags = immediate;
-					while (*p != '\0')
+					while ( (p < end) && (*p != '\0') )
 						++p;
+					if ( p == end )
+						dyld::throwf("malformed binding opcodes: symbol name extends past end of opcodes");
 					++p;
 					break;
 				case BIND_OPCODE_SET_TYPE_IMM:
