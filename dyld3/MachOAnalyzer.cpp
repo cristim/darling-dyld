@@ -2670,6 +2670,15 @@ void MachOAnalyzer::parseOrgArm64eChainedFixups(Diagnostics& diag, void (^target
     }
 }
 
+static bool chainedImportNameInPool(const char* pool, uint32_t poolSize, uint32_t nameOffset)
+{
+    for (uint32_t i = nameOffset; i < poolSize; ++i) {
+        if ( pool[i] == '\0' )
+            return true;
+    }
+    return false;
+}
+
 void MachOAnalyzer::forEachChainedFixupTarget(Diagnostics& diag, void (^callback)(int libOrdinal, const char* symbolName, uint64_t addend, bool weakImport, bool& stop)) const
 {
     LinkEditInfo leInfo;
@@ -2706,7 +2715,7 @@ void MachOAnalyzer::forEachChainedFixupTarget(Diagnostics& diag, void (^callback
                 imports = (dyld_chained_import*)((uint8_t*)header + header->imports_offset);
                 for (uint32_t i=0; i < header->imports_count && !stop; ++i) {
                     const char* symbolName = &symbolsPool[imports[i].name_offset];
-                    if ( imports[i].name_offset > maxSymbolOffset ) {
+                    if ( !chainedImportNameInPool(symbolsPool, maxSymbolOffset, imports[i].name_offset) ) {
                         diag.error("malformed import table, string overflow");
                         return;
                     }
@@ -2722,7 +2731,7 @@ void MachOAnalyzer::forEachChainedFixupTarget(Diagnostics& diag, void (^callback
                 importsA32 = (dyld_chained_import_addend*)((uint8_t*)header + header->imports_offset);
                 for (uint32_t i=0; i < header->imports_count && !stop; ++i) {
                     const char* symbolName = &symbolsPool[importsA32[i].name_offset];
-                    if ( importsA32[i].name_offset > maxSymbolOffset ) {
+                    if ( !chainedImportNameInPool(symbolsPool, maxSymbolOffset, importsA32[i].name_offset) ) {
                         diag.error("malformed import table, string overflow");
                         return;
                     }
@@ -2738,7 +2747,7 @@ void MachOAnalyzer::forEachChainedFixupTarget(Diagnostics& diag, void (^callback
                 importsA64 = (dyld_chained_import_addend64*)((uint8_t*)header + header->imports_offset);
                 for (uint32_t i=0; i < header->imports_count && !stop; ++i) {
                     const char* symbolName = &symbolsPool[importsA64[i].name_offset];
-                    if ( importsA64[i].name_offset > maxSymbolOffset ) {
+                    if ( !chainedImportNameInPool(symbolsPool, maxSymbolOffset, importsA64[i].name_offset) ) {
                         diag.error("malformed import table, string overflow");
                         return;
                     }
