@@ -1387,6 +1387,9 @@ void ImageLoaderMachOCompressed::eachBind(const LinkContext& context, bind_handl
                     switch (immediate) {
                         case BIND_SUBOPCODE_THREADED_SET_BIND_ORDINAL_TABLE_SIZE_ULEB:
                             count = read_uleb128(p, end);
+                            // each table entry needs at least one more opcode byte
+                            if ( count > (uintptr_t)(end - p) )
+                                dyld::throwf("malformed binding opcodes: threaded ordinal table size %lu exceeds remaining opcodes", count);
                             ordinalTable.clear();
                             // FIXME: ld64 wrote the wrong value here and we need to offset by 1 for now.
                             ordinalTable.reserve(count + 1);
@@ -1394,8 +1397,12 @@ void ImageLoaderMachOCompressed::eachBind(const LinkContext& context, bind_handl
                             break;
                         case BIND_SUBOPCODE_THREADED_APPLY: {
                             uint64_t delta = 0;
+                            if ( segmentIndex == -1 )
+                                dyld::throwf("BIND_SUBOPCODE_THREADED_APPLY missing preceding BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB");
                             do {
                                 address = segmentStartAddress + segOffset;
+                                if ( (address < segmentStartAddress) || (address + sizeof(uint64_t) > segmentEndAddress) )
+                                    throwBadBindingAddress(address, segmentEndAddress, segmentIndex, start, end, p);
                                 uint64_t value = *(uint64_t*)address;
 
 
@@ -1415,8 +1422,6 @@ void ImageLoaderMachOCompressed::eachBind(const LinkContext& context, bind_handl
                                         return;
                                     }
                                     std::tie(symbolName, addend, libraryOrdinal, symboFlags, type) = ordinalTable[ordinal].pack();
-                                    if ( (address < segmentStartAddress) || (address >= segmentEndAddress) )
-                                        throwBadBindingAddress(address, segmentEndAddress, segmentIndex, start, end, p);
                                     {
                                         handler(context, this, address, BIND_TYPE_THREADED_BIND,
                                                          symbolName, symboFlags, addend, libraryOrdinal,
