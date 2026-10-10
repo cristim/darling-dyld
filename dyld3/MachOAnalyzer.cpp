@@ -2679,6 +2679,11 @@ static bool chainedImportNameInPool(const char* pool, uint32_t poolSize, uint32_
     return false;
 }
 
+static bool chainedImportsFit(const dyld_chained_fixups_header* header, uint32_t dataSize, uint64_t entrySize)
+{
+    return (uint64_t)header->imports_offset + entrySize * header->imports_count <= dataSize;
+}
+
 void MachOAnalyzer::forEachChainedFixupTarget(Diagnostics& diag, void (^callback)(int libOrdinal, const char* symbolName, uint64_t addend, bool weakImport, bool& stop)) const
 {
     LinkEditInfo leInfo;
@@ -2712,6 +2717,10 @@ void MachOAnalyzer::forEachChainedFixupTarget(Diagnostics& diag, void (^callback
         int                                 libOrdinal;
         switch (header->imports_format) {
             case DYLD_CHAINED_IMPORT:
+                if ( !chainedImportsFit(header, leInfo.chainedFixups->datasize, sizeof(dyld_chained_import)) ) {
+                    diag.error("malformed import table");
+                    return;
+                }
                 imports = (dyld_chained_import*)((uint8_t*)header + header->imports_offset);
                 for (uint32_t i=0; i < header->imports_count && !stop; ++i) {
                     const char* symbolName = &symbolsPool[imports[i].name_offset];
@@ -2728,6 +2737,10 @@ void MachOAnalyzer::forEachChainedFixupTarget(Diagnostics& diag, void (^callback
                 }
                 break;
             case DYLD_CHAINED_IMPORT_ADDEND:
+                if ( !chainedImportsFit(header, leInfo.chainedFixups->datasize, sizeof(dyld_chained_import_addend)) ) {
+                    diag.error("malformed import table");
+                    return;
+                }
                 importsA32 = (dyld_chained_import_addend*)((uint8_t*)header + header->imports_offset);
                 for (uint32_t i=0; i < header->imports_count && !stop; ++i) {
                     const char* symbolName = &symbolsPool[importsA32[i].name_offset];
@@ -2744,6 +2757,10 @@ void MachOAnalyzer::forEachChainedFixupTarget(Diagnostics& diag, void (^callback
                 }
                 break;
             case DYLD_CHAINED_IMPORT_ADDEND64:
+                if ( !chainedImportsFit(header, leInfo.chainedFixups->datasize, sizeof(dyld_chained_import_addend64)) ) {
+                    diag.error("malformed import table");
+                    return;
+                }
                 importsA64 = (dyld_chained_import_addend64*)((uint8_t*)header + header->imports_offset);
                 for (uint32_t i=0; i < header->imports_count && !stop; ++i) {
                     const char* symbolName = &symbolsPool[importsA64[i].name_offset];

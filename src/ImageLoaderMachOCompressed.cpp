@@ -1036,7 +1036,9 @@ void ImageLoaderMachOCompressed::doApplyFixups(const LinkContext& context, const
 
 	// build table of resolved targets for each symbol ordinal
 	STACK_ALLOC_OVERFLOW_SAFE_ARRAY(const void*, targetAddrs, 128);
-	targetAddrs.reserve(fixupsHeader->imports_count);
+	// imports_count comes from the file; forEachChainedFixupTarget rejects a count that does not fit,
+	// so only reserve what the smallest import entries could fill
+	targetAddrs.reserve(std::min<uintptr_t>(fixupsHeader->imports_count, fChainedFixups->datasize / sizeof(dyld_chained_import)));
 	__block Diagnostics diag;
 	const dyld3::MachOAnalyzer* ma = (dyld3::MachOAnalyzer*)ml;
 	ma->forEachChainedFixupTarget(diag, ^(int libOrdinal, const char* symbolName, uint64_t addend, bool weakImport, bool& stop) {
