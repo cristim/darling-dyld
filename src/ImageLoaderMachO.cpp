@@ -1681,15 +1681,22 @@ void ImageLoaderMachO::makeTextSegmentWritable(const LinkContext& context, bool 
 }
 #endif
 
+// Deepest chain of re-exports followed for one lookup; real images stay far below it.
+static const unsigned kMaxReExportDepth = 16;
+
 const ImageLoader::Symbol* ImageLoaderMachO::findExportedSymbol(const char* name, bool searchReExports, const char* thisPath, const ImageLoader** foundIn, const ExportLookup* parent) const
 {
 	// Track this lookup's ancestry, not global/thread ownership. Include the
 	// symbol name because re-export trie entries may rename the requested symbol.
+	unsigned depth = 0;
 	for (const ExportLookup* p = parent; p != nullptr; p = p->parent) {
 		if ( p->image == this && p->searchReExports == searchReExports
 		  && strcmp(p->name, name) == 0 )
 			return NULL;
+		++depth;
 	}
+	if ( depth >= kMaxReExportDepth )
+		dyld::throwf("malformed mach-o image: re-export chain for %s deeper than %u in %s", name, kMaxReExportDepth, this->getPath());
 	const ExportLookup lookup = { this, name, parent, searchReExports };
 	// look in this image first
 	const ImageLoader::Symbol* result = this->findShallowExportedSymbol(name, foundIn, &lookup);
@@ -3010,8 +3017,10 @@ bool ImageLoaderMachO::getLazyBindingInfo(uint32_t& lazyBindingInfoOffset, const
 				break;
 			case BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM:
 				*symbolName = (char*)p;
-				while (*p != '\0')
+				while ( (p < lazyInfoEnd) && (*p != '\0') )
 					++p;
+				if ( p == lazyInfoEnd )
+					return false;
 				++p;
 				break;
 			case BIND_OPCODE_SET_TYPE_IMM:

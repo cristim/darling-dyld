@@ -1854,7 +1854,7 @@ const uint8_t* ImageLoader::trieWalk(const uint8_t* start, const uint8_t* end, c
 			return p;
 		}
 		const uint8_t* children = p + terminalSize;
-		if ( children > end ) {
+		if ( children >= end ) {
 			dyld::log("trieWalk() malformed trie node, terminalSize=0x%lx extends past end of trie\n", terminalSize);
 			return NULL;
 		}
@@ -1868,21 +1868,23 @@ const uint8_t* ImageLoader::trieWalk(const uint8_t* start, const uint8_t* end, c
 			bool wrongEdge = false;
 			// scan whole edge to get to next edge
 			// if edge is longer than target symbol name, don't read past end of symbol name
-			char c = *p;
-			while ( c != '\0' ) {
+			while ( (p < end) && (*p != '\0') ) {
 				if ( !wrongEdge ) {
-					if ( c != *ss )
+					if ( (char)*p != *ss )
 						wrongEdge = true;
 					++ss;
 				}
 				++p;
-				c = *p;
+			}
+			if ( p == end ) {
+				dyld::log("trieWalk() malformed trie node, child node extends past end of trie\n");
+				return NULL;
 			}
 			if ( wrongEdge ) {
 				// advance to next child
 				++p; // skip over zero terminator
 				// skip over uleb128 until last byte is found
-				while ( (*p & 0x80) != 0 )
+				while ( (p < end) && ((*p & 0x80) != 0) )
 					++p;
 				++p; // skip over last byte of uleb128
 				if ( p > end ) {
@@ -1895,7 +1897,7 @@ const uint8_t* ImageLoader::trieWalk(const uint8_t* start, const uint8_t* end, c
 				// so advance to the child's node
 				++p;
 				nodeOffset = read_uleb128(p, end);
-				if ( (nodeOffset == 0) || ( &start[nodeOffset] > end) ) {
+				if ( (nodeOffset == 0) || ( &start[nodeOffset] >= end) ) {
 					dyld::log("trieWalk() malformed trie child, nodeOffset=0x%lx out of range\n", nodeOffset);
 					return NULL;
 				}
