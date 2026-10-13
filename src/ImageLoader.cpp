@@ -1853,11 +1853,11 @@ const uint8_t* ImageLoader::trieWalk(const uint8_t* start, const uint8_t* end, c
 			//dyld::log("trieWalk(%p) returning %p\n", start, p);
 			return p;
 		}
-		const uint8_t* children = p + terminalSize;
-		if ( children >= end ) {
+		if ( terminalSize >= (uintptr_t)(end - p) ) {
 			dyld::log("trieWalk() malformed trie node, terminalSize=0x%lx extends past end of trie\n", terminalSize);
 			return NULL;
 		}
+		const uint8_t* children = p + terminalSize;
 		//dyld::log("trieWalk(%p) sym=%s, terminalSize=%lu, children=%p\n", start, s, terminalSize, children);
 		uint8_t childrenRemaining = *children++;
 		p = children;
@@ -1897,7 +1897,7 @@ const uint8_t* ImageLoader::trieWalk(const uint8_t* start, const uint8_t* end, c
 				// so advance to the child's node
 				++p;
 				nodeOffset = read_uleb128(p, end);
-				if ( (nodeOffset == 0) || ( &start[nodeOffset] >= end) ) {
+				if ( (nodeOffset == 0) || (nodeOffset >= (uintptr_t)(end - start)) ) {
 					dyld::log("trieWalk() malformed trie child, nodeOffset=0x%lx out of range\n", nodeOffset);
 					return NULL;
 				}

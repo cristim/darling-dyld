@@ -493,6 +493,10 @@ const ImageLoader::Symbol* ImageLoaderMachOCompressed::findShallowExportedSymbol
 			// re-export from another dylib, lookup there
 			const uintptr_t ordinal = read_uleb128(p, end);
 			const char* importedName = (char*)p;
+			while ( (p < end) && (*p != '\0') )
+				++p;
+			if ( p == end )
+				dyld::throwf("malformed trie, re-export name extends past end of trie in %s", this->getPath());
 			if ( importedName[0] == '\0' )
 				importedName = symbol;
 			if ( (ordinal > 0) && (ordinal <= libraryCount()) ) {
