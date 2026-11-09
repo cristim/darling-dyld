@@ -8,11 +8,15 @@
 //   patchclient <path> [list] [n]  exporters/symbols whose patch locations lie in the image's data segments
 //   patchexporters|patchexports <path>...  per exporting image: exports, clients, locations (and per export)
 //   slots <path> | stubs <path> <addr> <size> | sections <path> | imgexports <path>   image structure facts
+//   text <from> <to> [only-file] svc/TSD counts, commpage formations and offsets per image (windowed by __TEXT start)
+//   dataq <path>...             commpage-like 8-byte words in data segments
 #include "m3_cache.h"
+#include "a64.h"
 #include "trie.h"
 #include "patch_v4_check.h"
 #include "m3_util.h"
 #include "mode_patch.h"
+#include "mode_text.h"
 
 int main(int argc, char **argv)
 {
@@ -29,7 +33,9 @@ int main(int argc, char **argv)
     if (!strcmp(argv[1], "slots") && argc >= 6) return mode_slots(&c, argv[5]);
     if (!strcmp(argv[1], "sections") && argc >= 6) return mode_sections(&c, argv[5]);
     if (!strcmp(argv[1], "stubs") && argc >= 8) return mode_stubs(&c, argv[5], strtoull(argv[6], 0, 16), strtoull(argv[7], 0, 16));
+    if (!strcmp(argv[1], "text") && argc >= 7) return mode_text(&c, strtoull(argv[5], 0, 16), strtoull(argv[6], 0, 16), argc > 7 ? argv[7] : NULL);
     if (!strcmp(argv[1], "imgexports") && argc >= 6) return mode_imgexports(&c, argv[5]);
+    if (!strcmp(argv[1], "dataq") && argc >= 6) return mode_dataq(&c, argc - 5, argv + 5);
     fprintf(stderr, "unknown mode %s\n", argv[1]);
     return 2;
 }
