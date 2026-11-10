@@ -88,6 +88,10 @@ const char* splitCacheDirError(const char* dir);
 // nullptr on success, else why it cannot be built: a bad dir, an architecture without a cache or
 // without split mapper support, or a path longer than pathSize.
 const char* splitCacheMainFilePath(const char* dir, uint32_t cputype, uint32_t cpusubtype, char* path, size_t pathSize);
+
+// True only when dir is a directory and mainFilePath (the file splitCacheMainFilePath built) does not exist in it: the
+// directory has no cache for this architecture. Every other failure to use the file is left to mapSplitCachePrivate.
+bool splitCacheMainFileIsMissing(const char* dir, const char* mainFilePath);
 #endif
 
 
