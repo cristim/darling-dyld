@@ -657,7 +657,7 @@ const char* validateReverseRows(const ReverseRow* rows, size_t count)
 			return "a symbol is missing the Mach-O underscore";
 		for (size_t j = 0; j != i; ++j) {
 			if ( strcmp(rows[j].symbol, r.symbol) == 0 )
-				return "a symbol has two rows";
+				return "a symbol has two reverse rows";
 		}
 		if ( (r.evidence == nullptr) || (r.evidence[0] == '\0') )
 			return "a row has no evidence";
@@ -718,7 +718,7 @@ uint64_t reverseAdaptedTarget(const char* symbol, uint64_t target, bool targetIs
 	const ReverseRow* row = findReverseRow(symbol);
 	if ( row == nullptr )
 		return target;
-	if ( row->status == AdapterStatus::Unsupported ) {
+	if ( AdapterStatus::Unsupported == row->status ) {
 		dyld::warn("arm64e adapters: %s is bound by a plain image to an arm64e image and has no adapter (%s); a code pointer it passes or receives is not converted\n",
 				   symbol, row->evidence);
 		return target;
