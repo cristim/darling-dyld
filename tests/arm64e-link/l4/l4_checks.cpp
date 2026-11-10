@@ -457,6 +457,81 @@ int x8_get_unexpected_via_dlsym() {
     PASS();
 }
 
+
+// EXPERIMENT (c3 trap diagnosis, local): inspect the cache's handler globals inside the guest
+#if __has_feature(ptrauth_intrinsics)
+static void y_hex(const char *tag, unsigned long v) { put(" "); put(tag); put("="); puthex(v); }
+static unsigned long y_sign(unsigned long strip, int key, unsigned long disc) {
+    switch (key) {
+    case 0: return (unsigned long)__builtin_ptrauth_sign_unauthenticated((void *)strip, 0, disc);
+    case 1: return (unsigned long)__builtin_ptrauth_sign_unauthenticated((void *)strip, 1, disc);
+    case 2: return (unsigned long)__builtin_ptrauth_sign_unauthenticated((void *)strip, 2, disc);
+    default: return (unsigned long)__builtin_ptrauth_sign_unauthenticated((void *)strip, 3, disc);
+    }
+}
+// non-trapping: a slot value authenticates under (key, disc) iff it equals the signature of its own stripped value
+static void y_try(const char *label, unsigned long raw, unsigned long slot) {
+    unsigned long strip = (unsigned long)__builtin_ptrauth_strip((void *)raw, 0);
+    unsigned long blend = slot ? (unsigned long)__builtin_ptrauth_blend_discriminator((void *)slot, 0) : 0;
+    put("Y variant="); put(label);
+    y_hex("raw_is_unsigned", raw == strip);
+    y_hex("IA_d0", raw == y_sign(strip, 0, 0));
+    y_hex("IA_addr_d0", slot && raw == y_sign(strip, 0, blend));
+    y_hex("DA_d0", raw == y_sign(strip, 2, 0));
+    y_hex("DA_addr_d0", slot && raw == y_sign(strip, 2, blend));
+    y_hex("IB_d0", raw == y_sign(strip, 1, 0));
+    nl();
+}
+static void y_target(const char *what, unsigned long raw) {
+    unsigned long strip = (unsigned long)__builtin_ptrauth_strip((void *)raw, 0);
+    Dl_info di;
+    put("Y target of="); put(what); y_hex("raw", raw); y_hex("strip", strip);
+    if (dladdr((void *)strip, &di)) {
+        put(" image="); put(di.dli_fname ? di.dli_fname : "(none)");
+        put(" sname="); put(di.dli_sname ? di.dli_sname : "(none)");
+        y_hex("saddr", (unsigned long)di.dli_saddr);
+    }
+    nl();
+}
+static unsigned long y_slot(const char *sym) {
+    void *p = dlsym(RTLD_DEFAULT, sym);
+    put("Y sym="); put(sym); y_hex("addr", (unsigned long)p); nl();
+    if (!p) return 0;
+    unsigned long raw = *(unsigned long *)p;
+    y_target(sym, raw);
+    y_try(sym, raw, (unsigned long)p);
+    return raw;
+}
+int y1_handler_slots() {
+    y_slot("__cxa_terminate_handler");
+    y_slot("__cxa_unexpected_handler");
+    unsigned long g = (unsigned long)(void *)std::get_terminate();
+    y_try("get_terminate()", g, 0);
+    PASS();
+}
+void y_my_handler() { std::abort(); }
+// the counterfactual: hand the cache's libc++abi a compiler-signed handler, then the trap site must pass
+int y2_set_signed_terminate_then_init() {
+    unsigned long before = y_slot("__cxa_terminate_handler");
+    (void)before;
+    std::set_terminate(y_my_handler);
+    unsigned long after = y_slot("__cxa_terminate_handler");
+    unsigned long want = y_sign((unsigned long)__builtin_ptrauth_strip((void *)y_my_handler, 0), 0, 0);
+    put("Y after_set slot_equals_signed_handler="); puthex(after == want); nl();
+    typedef void (*init_fn)(void *, std::type_info *, void (*)(void *));
+    init_fn f = (init_fn)dlsym(RTLD_DEFAULT, "__cxa_init_primary_exception");
+    if (!f) return fail("dlsym(__cxa_init_primary_exception) failed");
+    void *p = __cxa_allocate_exception(8);
+    f(p, (std::type_info *)&typeid(int), nullptr);
+    put("Y init_primary_exception returned"); nl();
+    try { throw 7; } catch (int v) { REQUIRE(v == 7); }
+    PASS();
+}
+#else
+int y1_handler_slots() { return fail("not arm64e"); }
+int y2_set_signed_terminate_then_init() { return fail("not arm64e"); }
+#endif
+
 #define EXP_STD "c1=ok,c2=any,c3=ok,native=ok"
 // not from the cache is a recorded fact (failed), never a fault
 #define EXP_CACHE "c1=failed,c2=failed,c3=ok,native=failed"
@@ -502,6 +577,8 @@ const struct check checks[] = {
     {"x6_init_primary_stripped_dtor", x6_init_primary_stripped_dtor, "c1=any,c2=any,c3=any,native=any"},
     {"x7_init_primary_class_typeinfo", x7_init_primary_class_typeinfo, "c1=any,c2=any,c3=any,native=any"},
     {"x8_get_unexpected_via_dlsym", x8_get_unexpected_via_dlsym, "c1=any,c2=any,c3=any,native=any"},
+    {"y1_handler_slots", y1_handler_slots, "c1=any,c2=any,c3=any,native=any"},
+    {"y2_set_signed_terminate_then_init", y2_set_signed_terminate_then_init, "c1=any,c2=any,c3=any,native=any"},
     {"x4_init_primary_exception", x4_init_primary_exception, "c1=any,c2=any,c3=any,native=any"},
 };
 const int nchecks = sizeof checks / sizeof checks[0];
