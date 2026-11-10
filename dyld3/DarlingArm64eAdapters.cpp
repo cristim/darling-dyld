@@ -576,7 +576,63 @@ static uint64_t callRow(uint64_t* regs, const AdapterRow* row, uint64_t real)
 
 // ------------------------------------------------------------------------------------------ the opposite direction
 
-static CodeAddressPredicate sIsCode;
+static FunctionEntryPredicate sIsEntry;
+
+// The handlers that this module authenticated and handed back raw to plain code (the results of get_terminate and of the old
+// handler of set_terminate). Plain code that passes one back gets it signed again: arm64e code signed it first, so this
+// restores a signature that was verified, it creates no new one. A ring like the one of the sigaction rows: lock free, one
+// aligned word per slot, a lost entry only makes a restore fail closed.
+static const unsigned kHandedBackCount = 64;
+static uint64_t sHandedBack[kHandedBackCount];
+static uint32_t sHandedBackNext;
+
+static bool wasHandedBack(uint64_t pointer)
+{
+	if ( pointer == 0 )
+		return false;
+	for (unsigned i = 0; i != kHandedBackCount; ++i) {
+		if ( __atomic_load_n(&sHandedBack[i], __ATOMIC_RELAXED) == pointer )
+			return true;
+	}
+	return false;
+}
+
+static void recordHandedBack(uint64_t plainHandler)
+{
+	if ( wasHandedBack(plainHandler) )
+		return;
+	const uint32_t slot = __atomic_fetch_add(&sHandedBackNext, 1, __ATOMIC_RELAXED) % kHandedBackCount;
+	__atomic_store_n(&sHandedBack[slot], plainHandler, __ATOMIC_RELAXED);
+}
+
+bool functionStartsContain(const uint8_t* blob, size_t size, uint64_t offset)
+{
+	uint64_t address = 0;
+	size_t i = 0;
+	while ( i < size ) {
+		uint64_t delta = 0;
+		unsigned shift = 0;
+		bool more;
+		do {
+			if ( (i >= size) || (shift > 63) )
+				return false;
+			const uint8_t byte = blob[i++];
+			delta |= (uint64_t)(byte & 0x7f) << shift;
+			shift += 7;
+			more = (byte & 0x80) != 0;
+		} while ( more );
+		if ( delta == 0 )
+			break;
+		if ( delta > UINT64_MAX - address )
+			return false;
+		address += delta;
+		if ( address == offset )
+			return true;
+		if ( address > offset )
+			return false;
+	}
+	return false;
+}
 
 const ReverseRow* reverseRows(size_t* count)
 {
@@ -605,7 +661,7 @@ const char* validateReverseRows(const ReverseRow* rows, size_t count)
 		}
 		if ( (r.evidence == nullptr) || (r.evidence[0] == '\0') )
 			return "a row has no evidence";
-		const bool acts = (r.signMask != 0) || r.stripReturn;
+		const bool acts = (r.signMask != 0) || r.authReturn;
 		if ( r.status == AdapterStatus::Unsupported ) {
 			if ( acts )
 				return "a row without an adapter has an action";
@@ -623,9 +679,12 @@ const char* validateReverseRows(const ReverseRow* rows, size_t count)
 	return nullptr;
 }
 
-// Plain code is the source of every masked argument. An argument is signed only when it lies in an executable segment of
-// an image that is loaded now; 0, data addresses and values that already carry a signature (which no segment holds) go
-// through unchanged, and an arm64e callee that authenticates them then fails. Without a predicate nothing is signed.
+// Plain code is the source of every masked argument, but a signature is made only for a function entry of a plain image (the
+// predicate) or for a handler that was authenticated and handed back before; 0, data, arm64e addresses, mid-function addresses
+// and values that already carry a signature go through unchanged, and an arm64e callee that authenticates them then fails.
+// Without a predicate only handed-back handlers are signed. A handler that comes back must authenticate under IA/0: one that does
+// not stops the process (a plain caller must never be handed a pointer whose signature was merely removed). The non-hint
+// authentication is fine here: a reverse thunk only exists in a process that has an arm64e cache image, which runs on PAC hardware.
 static uint64_t callReverseRow(uint64_t* regs, const ReverseRow* row, uint64_t real)
 {
 	uint64_t a[8];
@@ -633,16 +692,26 @@ static uint64_t callReverseRow(uint64_t* regs, const ReverseRow* row, uint64_t r
 	for (unsigned i = 0; i != 8; ++i) {
 		if ( ((row->signMask >> i) & 1) == 0 )
 			continue;
-		if ( (a[i] != 0) && (sIsCode != nullptr) && sIsCode(a[i]) )
+		if ( a[i] == 0 )
+			continue;
+		const FunctionEntryPredicate isEntry = __atomic_load_n(&sIsEntry, __ATOMIC_RELAXED);
+		if ( ((isEntry != nullptr) && isEntry(a[i])) || wasHandedBack(a[i]) )
 			a[i] = AdapterSign::signPointer(a[i], nullptr, false, 0, 0);
 	}
 	uint64_t result = ((Call8)real)(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
-	if ( row->stripReturn )
-		result = stripCode(result);
+	if ( row->authReturn && !isSpecialHandler(result) ) {
+		const uint64_t authenticatedResult = authenticateIA(result, 0);
+		if ( !authenticated(authenticatedResult) ) {
+			dyld::warn("arm64e adapters: %s returned a handler that does not authenticate (IA, discriminator 0); it is not handed to plain code\n", row->symbol);
+			__builtin_trap();
+		}
+		recordHandedBack(authenticatedResult);
+		result = authenticatedResult;
+	}
 	return result;
 }
 
-uint64_t reverseAdaptedTarget(const char* symbol, uint64_t target, bool targetIsArm64e, CodeAddressPredicate isCode)
+uint64_t reverseAdaptedTarget(const char* symbol, uint64_t target, bool targetIsArm64e, FunctionEntryPredicate isEntry)
 {
 	if ( (sMode == AdapterMode::Off) || !targetIsArm64e )
 		return target;
@@ -654,7 +723,7 @@ uint64_t reverseAdaptedTarget(const char* symbol, uint64_t target, bool targetIs
 				   symbol, row->evidence);
 		return target;
 	}
-	__atomic_store_n(&sIsCode, isCode, __ATOMIC_RELAXED);
+	__atomic_store_n(&sIsEntry, isEntry, __ATOMIC_RELAXED);
 	const uint64_t thunk = emitThunk(row, true, target);
 	if ( thunk == 0 ) {
 		dyld::warn("arm64e adapters: no room for a thunk for %s; it is bound unadapted\n", symbol);
@@ -722,7 +791,8 @@ static const ReverseRow kReverseRows[] = { { "_unused", 0, false, 0, AdapterStat
 const ReverseRow* reverseRows(size_t* count) { *count = 0; return kReverseRows; }
 const ReverseRow* findReverseRow(const char*) { return nullptr; }
 const char* validateReverseRows(const ReverseRow*, size_t) { return nullptr; }
-uint64_t reverseAdaptedTarget(const char*, uint64_t target, bool, CodeAddressPredicate) { return target; }
+uint64_t reverseAdaptedTarget(const char*, uint64_t target, bool, FunctionEntryPredicate) { return target; }
+bool functionStartsContain(const uint8_t*, size_t, uint64_t) { return false; }
 size_t emitReverseThunk(uint32_t*, const ReverseRow*, uint64_t) { return 0; }
 size_t emitAuthThunk(uint32_t*, uint8_t, uint64_t) { return 0; }
 size_t emitCallThunk(uint32_t*, const AdapterRow*, uint64_t) { return 0; }

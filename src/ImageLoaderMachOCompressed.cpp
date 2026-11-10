@@ -862,18 +862,62 @@ uintptr_t ImageLoaderMachOCompressed::resolve(const LinkContext& context, const 
 }
 
 #ifdef DARLING
-// EXPERIMENT (local branch exp/l4-reverse-adapters): true when `address` lies in an executable segment of an image that is
-// loaded now. findImageContainingAddress reads the mapped-range list without a lock, like dlsym and dladdr do.
-static bool darlingAddressIsCode(uint64_t address)
+// EXPERIMENT (local branch exp/l4-reverse-adapters): true when `address` is a function entry of a loaded PLAIN image: the
+// address lies in an executable segment of an image that is neither arm64e nor in the shared cache, and its offset from the
+// mach header is one of the image's own LC_FUNCTION_STARTS. Metadata of the image only. findImageContainingAddress reads the
+// mapped-range list without a lock, like dlsym and dladdr; the image's LINKEDIT is read without dyld's lock too.
+static bool darlingAddressIsPlainFunctionEntry(uint64_t address)
 {
 	const ImageLoader* image = dyld::findImageContainingAddress((const void*)address);
-	if ( image == NULL )
+	if ( (image == NULL) || image->inSharedCache() )
 		return false;
+	const macho_header* mh = (const macho_header*)image->machHeader();
+	if ( dyld3::darling::cpusubtypeIsArm64e(mh->cpusubtype) )
+		return false;
+	bool inExecutableSegment = false;
 	for (unsigned i = 0, n = image->segmentCount(); i != n; ++i) {
 		if ( image->segExecutable(i) && (address >= image->segActualLoadAddress(i)) && (address < image->segActualEndAddress(i)) )
-			return true;
+			inExecutableSegment = true;
 	}
-	return false;
+	if ( !inExecutableSegment )
+		return false;
+	uint64_t textVmaddr = 0, linkeditVmaddr = 0, linkeditFileoff = 0;
+	bool haveText = false, haveLinkedit = false, haveStarts = false;
+	uint32_t startsOffset = 0, startsSize = 0;
+	const uint8_t* cmd = (const uint8_t*)mh + sizeof(macho_header);
+	for (uint32_t i = 0; i != mh->ncmds; ++i) {
+		const load_command* lc = (const load_command*)cmd;
+		if ( lc->cmd == LC_SEGMENT_64 ) {
+			const segment_command_64* seg = (const segment_command_64*)lc;
+			if ( strcmp(seg->segname, "__TEXT") == 0 ) { textVmaddr = seg->vmaddr; haveText = true; }
+			if ( strcmp(seg->segname, "__LINKEDIT") == 0 ) { linkeditVmaddr = seg->vmaddr; linkeditFileoff = seg->fileoff; haveLinkedit = true; }
+		}
+		else if ( lc->cmd == LC_FUNCTION_STARTS ) {
+			const linkedit_data_command* data = (const linkedit_data_command*)lc;
+			startsOffset = data->dataoff; startsSize = data->datasize; haveStarts = true;
+		}
+		cmd += lc->cmdsize;
+	}
+	if ( !haveText || !haveLinkedit || !haveStarts || (startsOffset < linkeditFileoff) )
+		return false;
+	const uintptr_t slide = (uintptr_t)mh - (uintptr_t)textVmaddr;
+	const uint8_t* blob = (const uint8_t*)(linkeditVmaddr + slide + (startsOffset - linkeditFileoff));
+	return dyld3::darling::functionStartsContain(blob, startsSize, address - (uint64_t)(uintptr_t)mh);
+}
+#endif
+
+#ifdef DARLING
+// What a plain image binds for an import of an export of an arm64e image: a thunk that signs the code pointers the plain image
+// passes and authenticates the handlers it receives (DarlingArm64eAdapters.h). Anything else binds as it was resolved: an
+// arm64e importer, a bind with an addend, a target that is not in the exporting image (an interposer's address).
+static uintptr_t darlingPlainImportTarget(const ImageLoader* importer, const char* symbolName, uintptr_t symbolAddress,
+										  intptr_t addend, const ImageLoader* exporter)
+{
+	if ( (exporter == NULL) || (addend != 0) || !exporter->containsAddress((void*)symbolAddress) )
+		return symbolAddress;
+	if ( dyld3::darling::cpusubtypeIsArm64e(importer->machHeader()->cpusubtype) )
+		return symbolAddress;
+	return dyld3::darling::reverseAdaptedTarget(symbolName, symbolAddress, dyld3::darling::cpusubtypeIsArm64e(exporter->machHeader()->cpusubtype), &darlingAddressIsPlainFunctionEntry);
 }
 #endif
 
@@ -894,11 +938,9 @@ uintptr_t ImageLoaderMachOCompressed::bindAt(const LinkContext& context, ImageLo
     } else
         symbolAddress = image->resolve(context, symbolName, symbolFlags, libraryOrdinal, &targetImage, patcher, last, runResolver);
 #ifdef DARLING
-	// EXPERIMENT: a plain image binding an export of an arm64e image (the shared cache's libc++abi) gets a thunk that signs
-	// the code pointers it passes and strips the ones it receives; an address outside the target image is an interposer's
-	if ( (type != BIND_TYPE_THREADED_REBASE) && (addend == 0) && (targetImage != NULL) && targetImage->containsAddress((void*)symbolAddress)
-	  && !dyld3::darling::cpusubtypeIsArm64e(image->machHeader()->cpusubtype) )
-		symbolAddress = dyld3::darling::reverseAdaptedTarget(symbolName, symbolAddress, dyld3::darling::cpusubtypeIsArm64e(targetImage->machHeader()->cpusubtype), &darlingAddressIsCode);
+	// EXPERIMENT: the opposite direction, a plain image binding an export of an arm64e image
+	if ( type != BIND_TYPE_THREADED_REBASE )
+		symbolAddress = darlingPlainImportTarget(image, symbolName, symbolAddress, addend, targetImage);
 #endif
 
 	// do actual update
@@ -1076,8 +1118,8 @@ void ImageLoaderMachOCompressed::doApplyFixups(const LinkContext& context, const
 			if ( (addend == 0) && (targetImage != NULL) && targetImage->containsAddress((void*)symbolAddress) && dyld3::darling::cpusubtypeIsArm64e(this->machHeader()->cpusubtype) )
 				symbolAddress = dyld3::darling::adaptedTarget(symbolName, symbolAddress, dyld3::darling::cpusubtypeIsArm64e(targetImage->machHeader()->cpusubtype));
 			// EXPERIMENT: and the opposite direction, a plain image with chained fixups binding an export of an arm64e image
-			else if ( (addend == 0) && (targetImage != NULL) && targetImage->containsAddress((void*)symbolAddress) )
-				symbolAddress = dyld3::darling::reverseAdaptedTarget(symbolName, symbolAddress, dyld3::darling::cpusubtypeIsArm64e(targetImage->machHeader()->cpusubtype), &darlingAddressIsCode);
+			else
+				symbolAddress = darlingPlainImportTarget(this, symbolName, symbolAddress, addend, targetImage);
 #endif
 			targetAddrs.push_back((void*)(symbolAddress + addend));
 		}

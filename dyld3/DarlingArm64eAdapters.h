@@ -81,39 +81,49 @@ uint64_t adaptedTarget(const char* symbol, uint64_t target, bool targetIsArm64e)
 // ------------------------------------------------------------------------------------------ the opposite direction
 //
 // EXPERIMENT (local branch exp/l4-reverse-adapters, never pushed). A PLAIN importer (Darling's libobjc, any plain image)
-// binding an export of an ARM64E image (the shared cache's libc++ and libc++abi). The arm64e callee stores or calls a
-// function pointer argument through an authenticated call and expects a signature (key IA, discriminator 0, what the
-// compiler gives a C function pointer); plain code never signs. And plain code cannot call a handler that the arm64e callee
-// hands back signed. A thunk signs each masked argument on the way in and strips the result on the way out.
+// binding an export of an ARM64E image (the shared cache's libc++ and libc++abi): only those binds get a reverse thunk
+// (the hooks in ImageLoaderMachOCompressed.cpp check that the importer is plain and the exporter arm64e; an arm64e importer
+// binds the arm64e export directly and an interposer's address is never wrapped). The arm64e callee stores or calls a
+// function pointer argument through an authenticated call and expects a signature (key IA, discriminator 0: the default
+// schema of a C function pointer, what the open-source libc++abi's re-sign into its __ptrauth fields authenticates its source
+// with; the callee re-signs for its own fields with discriminators that no caller sees). Plain code never signs, and cannot
+// call a handler that the arm64e callee hands back signed.
 //
-// Residual trust: plain code is the trusted source of what it passes, so a pointer it hands over is signed without proof
-// of origin; that is the point of this direction. It is not a signing oracle for attacker-chosen values because (1) only a
-// plain importer's own binds reach the thunk (an arm64e importer binds the arm64e export directly, and cannot reach the
-// thunk by dlsym either), (2) the thunk signs an argument only when it lies in an executable segment of an image that is
-// loaded right now, so heap, stack and data values and values that already carry a signature pass through unchanged (and
-// then fail where they are authenticated), (3) 0 is never signed. What it does not prove: that the address is the start of
-// a function. A plain image that an attacker can drive to call set_terminate(x) with any x in a code segment can pick x,
-// which is also what it could do by calling x itself.
+// In: an argument is signed only when the predicate says it is a known function entry of a loaded PLAIN image (dyld: the
+// address lies in an executable segment of a non-arm64e, non-cache image and is in that image's LC_FUNCTION_STARTS), or it is
+// exactly a handler this module authenticated and handed back to plain code before (a round trip: set_terminate(old)). So arm64e
+// code, mid-function addresses, data, stack and heap values never get a signature from the thunk, and a value that already
+// carries a signature passes through unchanged. 0 is never signed. Out: a returned handler is authenticated (IA, 0) and handed
+// back raw; one that does not authenticate stops the process with a message naming the symbol; 0, 1 and -1 pass.
+//
+// Residual trust: a plain image's function entry can be signed for the callee by any plain caller that binds the thunk, so an
+// attacker who controls the argument of a plain call to set_terminate gets one of the plain images' function entries installed
+// as a handler, which is what that caller could do by calling the entry itself. Limitation: the entry check reads the image's
+// mapped LINKEDIT without dyld's lock (like dladdr), so a dlclose of that image during the call is a race; and an image
+// without LC_FUNCTION_STARTS signs nothing (fail closed).
 struct ReverseRow {
 	const char*		symbol;			// Mach-O name, with the leading underscore
 	uint8_t			signMask;		// bit i: argument i is a code pointer to sign (IA, discriminator 0)
-	bool			stripReturn;	// the result is a code pointer that plain code calls: strip its signature
+	bool			authReturn;		// the result is a handler: authenticate it (IA, 0) and hand plain code the raw pointer
 	uint8_t			argCount;		// register arguments up to the last one the row touches, at most 8; 0 for a getter
 	AdapterStatus	status;			// Probed, ShapeOnly or Unsupported
 	const char*		evidence;		// never empty
 };
 
-typedef bool (*CodeAddressPredicate)(uint64_t address);
+// true when `address` may be signed for an arm64e callee: a function entry of a loaded plain image
+typedef bool (*FunctionEntryPredicate)(uint64_t address);
 
 const ReverseRow* reverseRows(size_t* count);
 const ReverseRow* findReverseRow(const char* symbol);
 const char* validateReverseRows(const ReverseRow* rows, size_t count);
 
+// Whether `offset` (from the start of the image's __TEXT segment, where the mach header is) is one of the function starts in an
+// LC_FUNCTION_STARTS blob (ULEB128 deltas from 0, ended by a zero delta). A malformed blob says false.
+bool functionStartsContain(const uint8_t* blob, size_t size, uint64_t offset);
+
 // What a plain importer should bind for `symbol` when the resolved target is at `target` in an arm64e image: a thunk when
-// there is a supported row, otherwise `target` (an Unsupported row warns). isCode says whether an address lies in an
-// executable segment of a loaded image; it is kept for the thunks' calls. The caller has checked that the importer is plain
-// and that `target` lies in its exporter, not in an interposer.
-uint64_t reverseAdaptedTarget(const char* symbol, uint64_t target, bool targetIsArm64e, CodeAddressPredicate isCode);
+// there is a supported row, otherwise `target` (an Unsupported row warns). isEntry is kept for the thunks' calls.
+uint64_t reverseAdaptedTarget(const char* symbol, uint64_t target, bool targetIsArm64e, FunctionEntryPredicate isEntry);
 
 // DYLD_DARLING_ARM64E_ADAPTERS: off binds the raw targets, as before the adapters existed. report also warns, once per
 // symbol, for every plain function an arm64e image binds that has no row at all (the way to find a callback-taking import

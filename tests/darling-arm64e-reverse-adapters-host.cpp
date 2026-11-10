@@ -8,6 +8,9 @@
 #include <string.h>
 #include <string>
 #include <sys/mman.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <signal.h>
 
 #include "DarlingArm64eAdapters.h"
 
@@ -46,12 +49,17 @@ static uint64_t fakeCallee(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, u
 }
 typedef uint64_t (*Fn8)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 
-// code addresses are those in [kCodeLow, kCodeHigh); everything else is data to the predicate
+// The fake dyld predicate. A plain image's function entries are the multiples of 0x40 in [kCodeLow, kCodeHigh) that are in
+// kEntries; every other address is a mid-function address of that image, an address in an arm64e image (kArm64eLow..), or
+// data, and none of them is an entry.
 static const uint64_t kCodeLow = 0x0000000100003000ULL, kCodeHigh = 0x0000000100009000ULL;
-static bool gPredicateCalls;
-static bool isCode(uint64_t a) { gPredicateCalls = true; return (a >= kCodeLow) && (a < kCodeHigh); }
+static const uint64_t kArm64eLow = 0x0000000180000000ULL;
+static bool isEntry(uint64_t a)
+{
+	return (a >= kCodeLow) && (a < kCodeHigh) && (((a - kCodeLow) % 0x40) == 0);
+}
 static uint64_t codeAddress(int n) { return kCodeLow + 0x40 * n; }
-// an address whose signature differs from the address, and from its signature under another modifier
+// an entry whose signature differs from the address, and from its signature under another modifier
 static uint64_t goodCode(int n)
 {
 	uint64_t p = codeAddress(n);
@@ -62,7 +70,7 @@ static uint64_t goodCode(int n)
 
 static Fn8 thunkFor(const char* symbol)
 {
-	const uint64_t t = reverseAdaptedTarget(symbol, (uint64_t)&fakeCallee, true, &isCode);
+	const uint64_t t = reverseAdaptedTarget(symbol, (uint64_t)&fakeCallee, true, &isEntry);
 	CHECK(t != (uint64_t)&fakeCallee, "%s was not adapted", symbol);
 	return (Fn8)t;
 }
@@ -114,17 +122,21 @@ static void checkSetHandler()
 	args[0] = 0; gResult = 0; callWith(f, args);
 	CHECK(gSeen[0] == 0, "NULL was changed to %llx", (unsigned long long)gSeen[0]);
 
-	// a data address (not in a code window) passes unchanged: not a signing oracle for data
+	// not function entries: data, garbage, a mid-function address of a plain image, an address of an arm64e image
 	args[0] = 0x0000000200001000ULL; callWith(f, args);
 	CHECK(gSeen[0] == 0x0000000200001000ULL, "a data address was signed");
 	args[0] = 0xdeadbeef; callWith(f, args);
 	CHECK(gSeen[0] == 0xdeadbeef, "garbage was signed");
+	args[0] = h + 4; callWith(f, args);
+	CHECK(gSeen[0] == h + 4, "a mid-function address of a plain image was signed");
+	args[0] = kArm64eLow + 0x40; callWith(f, args);
+	CHECK(gSeen[0] == kArm64eLow + 0x40, "an address in an arm64e image was signed");
 
 	// a value that already carries a signature (a round trip through plain code) is not in a code window: unchanged
 	const uint64_t signedAlready = oracleSign(h, 0);
 	args[0] = signedAlready; callWith(f, args);
 	CHECK(gSeen[0] == signedAlready, "an already signed pointer was changed");
-	// control for the window: the same address stripped is signed
+	// control: the same address stripped is signed
 	args[0] = h; callWith(f, args);
 	CHECK(gSeen[0] == oracleSign(h, 0), "control: the stripped address was not signed");
 }
@@ -136,12 +148,75 @@ static void checkGetters()
 		const uint64_t h = goodCode(3);
 		gResult = oracleSign(h, 0); gCalls = 0;
 		const uint64_t r = callWith(f, kS);
-		CHECK(r == h, "%s result %llx not stripped to %llx", sym, (unsigned long long)r, (unsigned long long)h);
+		CHECK(r == h, "%s result %llx not the raw handler %llx", sym, (unsigned long long)r, (unsigned long long)h);
 		for (int i = 0; i < 8; ++i)
 			CHECK(gSeen[i] == kS[i], "%s argument %d changed", sym, i);
 		gResult = 0; callWith(f, kS);
 		CHECK(callWith(f, kS) == 0, "%s: a NULL handler came back as non-zero", sym);
 	}
+}
+
+static bool childTraps(Fn8 f, uint64_t result)
+{
+	// the thunk must not return a pointer whose signature failed: the child traps, it never gets to exit(0)
+	fflush(stdout);
+	const pid_t pid = fork();
+	if ( pid == 0 ) {
+		gResult = result;
+		callWith(f, kS);
+		_exit(0);
+	}
+	int status = 0;
+	waitpid(pid, &status, 0);
+	return WIFSIGNALED(status) && ((WTERMSIG(status) == SIGTRAP) || (WTERMSIG(status) == SIGILL));
+}
+
+static void checkReturnAuthentication()
+{
+	for (const char* sym : { "__ZSt13get_terminatev", "__ZSt13set_terminatePFvvE" }) {
+		Fn8 f = thunkFor(sym);
+		const uint64_t h = goodCode(9);
+		CHECK(!childTraps(f, oracleSign(h, 0)), "%s: a handler with a good signature stopped the process", sym);
+		CHECK(!childTraps(f, 0) && !childTraps(f, 1) && !childTraps(f, ~0ULL), "%s: 0, 1 or -1 stopped the process", sym);
+		CHECK(childTraps(f, h), "%s: an unsigned handler was handed to plain code", sym);
+		CHECK(childTraps(f, oracleSign(h, 1)), "%s: a handler signed with another modifier was handed to plain code", sym);
+		CHECK(childTraps(f, oracleSign(h, 0) ^ (1ULL << 50)), "%s: a corrupted signature was handed to plain code", sym);
+	}
+}
+
+static void checkRoundTrip()
+{
+	// get_terminate hands out an authenticated handler in an ARM64E image; plain code that passes it back gets it signed
+	// again, but an arm64e address that was never handed out is not signed (no entry, never handed back)
+	Fn8 get = thunkFor("__ZSt13get_terminatev");
+	Fn8 set = thunkFor("__ZSt13set_terminatePFvvE");
+	const uint64_t arm64eHandler = kArm64eLow + 0x1000, other = kArm64eLow + 0x2000;
+	CHECK(!isEntry(arm64eHandler), "the fake predicate is wrong");
+	gResult = oracleSign(arm64eHandler, 0);
+	CHECK(callWith(get, kS) == arm64eHandler, "get_terminate did not hand out the raw handler");
+	uint64_t args[8]; memcpy(args, kS, sizeof(args));
+	gResult = 0;
+	args[0] = arm64eHandler; callWith(set, args);
+	CHECK(gSeen[0] == oracleSign(arm64eHandler, 0), "a handed-back handler was not signed again");
+	args[0] = other; callWith(set, args);
+	CHECK(gSeen[0] == other, "an arm64e address that was never handed out was signed");
+}
+
+static void checkFunctionStarts()
+{
+	// deltas 0x10, 0x20, 0x08 give the starts 0x10, 0x30, 0x38; a zero delta ends the table
+	const uint8_t blob[] = { 0x10, 0x20, 0x08, 0x00, 0x7f };
+	CHECK(functionStartsContain(blob, sizeof(blob), 0x10) && functionStartsContain(blob, sizeof(blob), 0x30) && functionStartsContain(blob, sizeof(blob), 0x38), "a start was not found");
+	CHECK(!functionStartsContain(blob, sizeof(blob), 0x0) && !functionStartsContain(blob, sizeof(blob), 0x11) && !functionStartsContain(blob, sizeof(blob), 0x34) && !functionStartsContain(blob, sizeof(blob), 0x3c), "a non-start was found");
+	CHECK(!functionStartsContain(blob, sizeof(blob), 0x7f + 0x38), "an entry after the terminator was found");
+	const uint8_t multi[] = { 0xb4, 0x24, 0x01, 0x00 };	// 0x1234, then 1: starts 0x1234, 0x1235
+	CHECK(functionStartsContain(multi, sizeof(multi), 0x1234) && functionStartsContain(multi, sizeof(multi), 0x1235), "a multi-byte delta was misread");
+	CHECK(!functionStartsContain(multi, sizeof(multi), 0x34), "a multi-byte delta was read as a single byte");
+	const uint8_t truncated[] = { 0x10, 0x80 };
+	CHECK(functionStartsContain(truncated, sizeof(truncated), 0x10) && !functionStartsContain(truncated, sizeof(truncated), 0x20), "a truncated blob was misread");
+	const uint8_t endless[] = { 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01 };
+	CHECK(!functionStartsContain(endless, sizeof(endless), 0x10) && !functionStartsContain(endless, sizeof(endless), 0x40) && !functionStartsContain(endless, sizeof(endless), 0x2000), "an over-long ULEB was accepted");
+	CHECK(!functionStartsContain(nullptr, 0, 0x10), "an empty blob has a start");
 }
 
 static void checkArgPositions()
@@ -172,12 +247,13 @@ static void checkArgPositions()
 
 static void checkPolicy()
 {
-	CHECK(reverseAdaptedTarget("__ZSt13set_terminatePFvvE", 0x1234, false, &isCode) == 0x1234, "an exporter that is plain was adapted");
-	CHECK(reverseAdaptedTarget("_not_a_row", 0x1234, true, &isCode) == 0x1234, "an unknown symbol was adapted");
+	CHECK(reverseAdaptedTarget("__ZSt13set_terminatePFvvE", 0x1234, false, &isEntry) == 0x1234, "an exporter that is plain was adapted");
+	CHECK(reverseAdaptedTarget("_not_a_row", 0x1234, true, &isEntry) == 0x1234, "an unknown symbol was adapted");
 	// no predicate: nothing is signed
 	const uint64_t t = reverseAdaptedTarget("__ZSt15set_new_handlerPFvvE", (uint64_t)&fakeCallee, true, nullptr);
 	CHECK(t != (uint64_t)&fakeCallee, "no thunk without a predicate");
 	uint64_t args[8]; memcpy(args, kS, sizeof(args)); args[0] = goodCode(8);
+	gResult = 0;
 	callWith((Fn8)t, args);
 	CHECK(gSeen[0] == args[0], "a pointer was signed with no predicate to vouch for it");
 	// an unsupported row binds the target and warns
@@ -188,19 +264,19 @@ static void checkPolicy()
 		if ( rows[i].status == AdapterStatus::Unsupported ) unsupported = rows[i].symbol;
 	CHECK(unsupported != nullptr, "no unsupported row in the table");
 	if ( unsupported ) {
-		CHECK(reverseAdaptedTarget(unsupported, 0x1234, true, &isCode) == 0x1234, "an unsupported row was adapted");
+		CHECK(reverseAdaptedTarget(unsupported, 0x1234, true, &isEntry) == 0x1234, "an unsupported row was adapted");
 		CHECK(gWarnings.find(unsupported) != std::string::npos, "an unsupported row did not warn");
 	}
 	setAdapterMode(AdapterMode::Off);
-	CHECK(reverseAdaptedTarget("__ZSt13set_terminatePFvvE", 0x1234, true, &isCode) == 0x1234, "mode off still adapted");
+	CHECK(reverseAdaptedTarget("__ZSt13set_terminatePFvvE", 0x1234, true, &isEntry) == 0x1234, "mode off still adapted");
 	setAdapterMode(AdapterMode::On);
 	// a thunk is made once per symbol and target
-	CHECK(reverseAdaptedTarget("__ZSt13set_terminatePFvvE", (uint64_t)&fakeCallee, true, &isCode) == reverseAdaptedTarget("__ZSt13set_terminatePFvvE", (uint64_t)&fakeCallee, true, &isCode), "two thunks for one symbol and target");
+	CHECK(reverseAdaptedTarget("__ZSt13set_terminatePFvvE", (uint64_t)&fakeCallee, true, &isEntry) == reverseAdaptedTarget("__ZSt13set_terminatePFvvE", (uint64_t)&fakeCallee, true, &isEntry), "two thunks for one symbol and target");
 }
 
 static void checkThunkPage()
 {
-	const uint64_t t = reverseAdaptedTarget("__ZSt13set_terminatePFvvE", (uint64_t)&fakeCallee, true, &isCode);
+	const uint64_t t = reverseAdaptedTarget("__ZSt13set_terminatePFvvE", (uint64_t)&fakeCallee, true, &isEntry);
 	FILE* maps = fopen("/proc/self/maps", "r");
 	char line[512]; bool found = false, rx = false;
 	while ( maps && fgets(line, sizeof(line), maps) ) {
@@ -216,12 +292,15 @@ int main(int argc, char** argv)
 	if ( argc >= 2 && strcmp(argv[1], "rows") == 0 ) {
 		size_t n = 0; const ReverseRow* rows = reverseRows(&n);
 		for (size_t i = 0; i != n; ++i)
-			printf("%s %x %d %d %d\n", rows[i].symbol, rows[i].signMask, rows[i].stripReturn, rows[i].argCount, (int)rows[i].status);
+			printf("%s %x %d %d %d\n", rows[i].symbol, rows[i].signMask, rows[i].authReturn, rows[i].argCount, (int)rows[i].status);
 		return 0;
 	}
 	checkTable();
 	checkSetHandler();
 	checkGetters();
+	checkReturnAuthentication();
+	checkRoundTrip();
+	checkFunctionStarts();
 	checkArgPositions();
 	checkPolicy();
 	checkThunkPage();

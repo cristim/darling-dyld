@@ -50,6 +50,8 @@ REPLAY = <<~'CPP'
     const MachHeader* machHeader() const { return &mh; }
     bool containsAddress(const void* a) const { return (uint64_t)a >= lo && (uint64_t)a < hi; }
   };
+  // the opposite direction (ImageLoaderMachOCompressed.cpp) is tested by tests/darling-arm64e-reverse-adapters.rb and the guest
+  template <class I, class N, class T, class D, class E> static T darlingPlainImportTarget(I, N, T a, D, E) { return a; }
   static ImageLoader gArm64eCaller = { { 2 }, 0x1000, 0x2000 };
   static ImageLoader gPlainCaller = { { 0 }, 0x2000, 0x3000 };
   static ImageLoader gPlainTarget = { { 0 }, 0x3000, 0x4000 };

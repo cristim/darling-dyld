@@ -1,12 +1,12 @@
 // The rows of the opposite-direction adapter table (a PLAIN importer binding an export of an arm64e image).
-// symbol, signMask, stripReturn, argCount, status, evidence. Argument numbers count from 0; for a member function argument 0 is this.
+// symbol, signMask, authReturn, argCount, status, evidence. Argument numbers count from 0; for a member function argument 0 is this.
 // Provenance: public prototypes of libc++/libc++abi (the C++ standard headers and cxxabi.h) for every export of the shared cache's
 // libc++ and libc++abi (L4-facts-data export lists) whose mangled name has a function-pointer parameter, plus the three handler
 // getters; the exports that Darling's plain libraries import are listed by the enumeration in the notes.
 	{ "__ZSt13set_terminatePFvvE", 0x1, true, 1, AdapterStatus::Probed, "C++ <exception>/<new>: terminate_handler set_terminate(terminate_handler) noexcept; the cache stores the pointer and re-signs it for the exception header (L4 c3 checks y1, y2); libobjc calls it with a plain pointer (objc-exception.mm)" },
 	{ "__ZSt14set_unexpectedPFvvE", 0x1, true, 1, AdapterStatus::ShapeOnly, "C++ <exception>/<new>: unexpected_handler set_unexpected(unexpected_handler); the shape of set_terminate" },
 	{ "__ZSt15set_new_handlerPFvvE", 0x1, true, 1, AdapterStatus::ShapeOnly, "C++ <exception>/<new>: new_handler set_new_handler(new_handler) noexcept; the shape of set_terminate" },
-	{ "__ZSt13get_terminatev", 0x0, true, 0, AdapterStatus::Probed, "C++ <exception>/<new>: terminate_handler get_terminate() noexcept; the cache returns it signed, plain code calls it unsigned" },
+	{ "__ZSt13get_terminatev", 0x0, true, 0, AdapterStatus::Probed, "C++ <exception>/<new>: terminate_handler get_terminate() noexcept; the cache returns it signed; it is authenticated and handed to plain code raw" },
 	{ "__ZSt14get_unexpectedv", 0x0, true, 0, AdapterStatus::ShapeOnly, "C++ <exception>/<new>: unexpected_handler get_unexpected() noexcept; the shape of get_terminate" },
 	{ "__ZSt15get_new_handlerv", 0x0, true, 0, AdapterStatus::ShapeOnly, "C++ <exception>/<new>: new_handler get_new_handler() noexcept; the shape of get_terminate; imported by a plain Darling image" },
 	{ "___cxa_throw", 0x4, false, 3, AdapterStatus::ShapeOnly, "cxxabi.h: void __cxa_throw(void*, std::type_info*, void (*dest)(void*)); dest is stored in the exception header and signed for it by the cache; the typeinfo of a plain image still has a plain vtable (unsupported, see the notes)" },

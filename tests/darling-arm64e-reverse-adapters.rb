@@ -38,13 +38,13 @@ Dir.mktmpdir('rev-adapters') do |dir|
     member = sym.start_with?('__ZNSt3__1') && !sym.include?('__call_once')
     is_getter = sym =~ /get_(terminate|unexpected|new_handler)v\z/
     if is_getter
-      check("#{sym}: a getter strips and signs nothing", strip && mask == 0)
+      check("#{sym}: a getter authenticates the result and signs nothing", strip && mask == 0)
     elsif sym =~ /set_(terminate|unexpected|new_handler)P/
-      check("#{sym}: sets sign argument 0 and strip the old handler", mask == 1 && strip)
+      check("#{sym}: sets sign argument 0 and authenticate the old handler", mask == 1 && strip)
     elsif sym == '___cxa_throw'
       check('___cxa_throw signs the destructor (argument 2)', mask == 4 && !strip)
     else
-      check("#{sym}: #{pf} function pointer parameter(s) are signed, nothing is stripped", mask.to_s(2).count('1') == pf && !strip && argc >= 1)
+      check("#{sym}: #{pf} function pointer parameter(s) are signed, no result is a handler", mask.to_s(2).count('1') == pf && !strip && argc >= 1)
     end
     _ = member
   end
@@ -55,13 +55,23 @@ Dir.mktmpdir('rev-adapters') do |dir|
     'signing is skipped' => ['a[i] = AdapterSign::signPointer(a[i], nullptr, false, 0, 0);', ';'],
     'signing uses the IB key' => ['a[i] = AdapterSign::signPointer(a[i], nullptr, false, 0, 0);', 'a[i] = AdapterSign::signPointer(a[i], nullptr, false, 0, 1);'],
     'signing uses a non-zero discriminator' => ['a[i] = AdapterSign::signPointer(a[i], nullptr, false, 0, 0);', 'a[i] = AdapterSign::signPointer(a[i], nullptr, false, 1, 0);'],
-    'the code-window check is skipped' => ['if ( (a[i] != 0) && (sIsCode != nullptr) && sIsCode(a[i]) )', 'if ( (a[i] != 0) )'],
-    'NULL is signed' => ['if ( (a[i] != 0) && (sIsCode != nullptr) && sIsCode(a[i]) )', 'if ( (sIsCode == nullptr) || sIsCode(a[i]) || (a[i] == 0) )'],
-    'signing without a predicate' => ['(sIsCode != nullptr) && sIsCode(a[i])', '((sIsCode == nullptr) || sIsCode(a[i]))'],
-    'the result is not stripped' => ["if ( row->stripReturn )\n\t\tresult = stripCode(result);", ';'],
-    'the mask bit is read from the wrong argument' => ["if ( ((row->signMask >> i) & 1) == 0 )\n\t\t\tcontinue;\n\t\tif ( (a[i] != 0) && (sIsCode", "if ( ((row->signMask >> (i + 1)) & 1) == 0 )\n\t\t\tcontinue;\n\t\tif ( (a[i] != 0) && (sIsCode"],
+    'the entry check is removed' => ['if ( ((isEntry != nullptr) && isEntry(a[i])) || wasHandedBack(a[i]) )', 'if ( true )'],
+    'the entry check is replaced by the handed-back ring only' => ['((isEntry != nullptr) && isEntry(a[i])) || wasHandedBack(a[i])', 'wasHandedBack(a[i])'],
+    'the handed-back ring is removed' => ['((isEntry != nullptr) && isEntry(a[i])) || wasHandedBack(a[i])', '((isEntry != nullptr) && isEntry(a[i]))'],
+    'a missing predicate signs' => ['((isEntry != nullptr) && isEntry(a[i]))', '((isEntry == nullptr) || isEntry(a[i]))'],
+    # (removing the NULL skip is an equivalent mutant: signPointer returns 0 for 0)
+    'the returned handler is stripped instead of authenticated' => ['const uint64_t authenticatedResult = authenticateIA(result, 0);', 'const uint64_t authenticatedResult = stripCode(result);'],
+    'the returned handler is authenticated with a modifier' => ['const uint64_t authenticatedResult = authenticateIA(result, 0);', 'const uint64_t authenticatedResult = authenticateIA(result, 1);'],
+    'a failed authentication is ignored' => ['\t\tif ( !authenticated(authenticatedResult) ) {', '\t\tif ( false ) {'],
+    'a failed authentication is stripped and returned' => ['__builtin_trap();\n\t\t}\n\t\trecordHandedBack(authenticatedResult);\n\t\tresult = authenticatedResult;', 'result = stripCode(result);\n\t\t}\n\t\trecordHandedBack(authenticatedResult);\n\t\tresult = stripCode(result);'],
+    'special values are authenticated' => ['if ( row->authReturn && !isSpecialHandler(result) )', 'if ( row->authReturn )'],
+    'the mask bit is read from the wrong argument' => ["if ( ((row->signMask >> i) & 1) == 0 )\n\t\t\tcontinue;\n\t\tif ( a[i] == 0 )", "if ( ((row->signMask >> (i + 1)) & 1) == 0 )\n\t\t\tcontinue;\n\t\tif ( a[i] == 0 )"],
     'a plain exporter is adapted' => ["if ( (sMode == AdapterMode::Off) || !targetIsArm64e )\n\t\treturn target;\n\tconst ReverseRow* row", "if ( (sMode == AdapterMode::Off) )\n\t\treturn target;\n\tconst ReverseRow* row"],
+    'a function start matches any later offset' => ['if ( address == offset )\n\t\t\treturn true;', 'if ( address >= offset )\n\t\t\treturn true;'],
+    'the terminator is ignored' => ['if ( delta == 0 )\n\t\t\tbreak;', ';'],
+    'the ULEB shift is unbounded' => ['(shift > 63)', '(false)'],
   }
+  mutants = mutants.transform_values { |pair| pair.map { |t| t.gsub('\\t', "\t").gsub('\\n', "\n") } }
   mutants.each do |name, (from, to)|
     unless adapters.include?(from)
       check("mutant #{name}: the source text is there to mutate", false)
