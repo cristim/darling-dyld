@@ -150,6 +150,15 @@ static void on_fault(int sig, siginfo_min *si, void *uc) {
     _exit(70);
 }
 
+// EXPERIMENT (T5, local, not for a PR). With the dyld adapters on (c2, c3) a code pointer that does not
+// authenticate is poisoned by the sigaction/pthread rows, so a handler installed stripped never runs and a
+// fault dies as a plain SIGSEGV with no report. In those configurations the harness hands over what the
+// compiler signed; everywhere else it still strips (L2 behaviour, adapters absent or off).
+static int streq(const char *a, const char *b);
+static const char *g_config;
+static int adapters_expected(void) { return streq(g_config, "c2") || streq(g_config, "c3"); }
+static void *harness_code(void *p) { return adapters_expected() ? p : STRIP(p); }
+
 // The harness (not the subject) installs the handler with its own signature stripped, so a
 // fault report does not depend on the thing under test. sigaction stores the pointer raw.
 static void install_handlers(void) {
@@ -162,7 +171,7 @@ static void install_handlers(void) {
     for (unsigned i = 0; i < sizeof sigs / sizeof sigs[0]; i++) sigaction(sigs[i], &sa, 0);
 #else
     struct sigaction sa;
-    sa.handler = STRIP((void *)on_fault);
+    sa.handler = harness_code((void *)on_fault);
     sa.mask = 0;
     sa.flags = SA_SIGINFO;
     for (unsigned i = 0; i < sizeof sigs / sizeof sigs[0]; i++) sigaction(sigs[i], &sa, 0);
@@ -180,14 +189,14 @@ static int st_ok(void) { ok_mark(1); return 0; }
 static int st_fault_main(void) { *(volatile int *)8 = 1; return 0; }
 static int st_fault_thread(void) {
     pthread_t t;
-    pthread_create(&t, 0, (void *(*)(void *))STRIP((void *)st_thread_fault), 0);
+    pthread_create(&t, 0, (void *(*)(void *))harness_code((void *)st_thread_fault), 0);
     pthread_join(t, 0);
     return 0;
 }
 static int st_fault_tsd_dtor(void) {
     pthread_t t;
-    pthread_key_create(&st_key, (void (*)(void *))STRIP((void *)st_dtor));
-    pthread_create(&t, 0, (void *(*)(void *))STRIP((void *)st_thread_setkey), 0);
+    pthread_key_create(&st_key, (void (*)(void *))harness_code((void *)st_dtor));
+    pthread_create(&t, 0, (void *(*)(void *))harness_code((void *)st_thread_setkey), 0);
     pthread_join(t, 0);
     return 0;
 }
