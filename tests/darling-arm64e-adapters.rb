@@ -31,8 +31,9 @@ def check(desc, ok, detail = nil)
 end
 
 # What the table must say, written from the Darwin prototypes and the L2 probe (tests/arm64e-link/abi), not from the table:
-# symbol => [strip mask, block arg + 1, struct arg + 1, return fix (0 none, 1 sign function IA0, 2 re-sign block invoke), argc, status (0 probed, 1 shape only, 2 unsupported)]
-SPEC = {
+# symbol => [auth mask, block arg + 1, struct arg + 1, return fix (0 none, 1 signal handler, 2 re-sign copied block), argc,
+#            status (0 probed, 1 shape only, 2 handled elsewhere, 3 unsupported)]
+HAND = {
   '___cxa_atexit' => [0x1, 0, 0, 0, 3, 0],                 # __cxa_atexit(void (*f)(void*), void* arg, void* dso)
   '_atexit' => [0x1, 0, 0, 0, 1, 0],                       # atexit(void (*f)(void))
   '_pthread_key_create' => [0x2, 0, 0, 0, 2, 0],           # (pthread_key_t*, void (*destructor)(void*))
@@ -45,12 +46,25 @@ SPEC = {
   '_sigaction' => [0x0, 0, 2, 0, 3, 0],                    # (sig, const struct sigaction* act, struct sigaction* oact)
   '_signal' => [0x2, 0, 0, 1, 2, 0],                       # sig_t signal(int, sig_t)
   '__Block_copy' => [0x0, 0, 0, 2, 1, 0],                  # void* _Block_copy(const void*)
-  '__tlv_atexit' => [0x1, 0, 0, 0, 2, 1],                  # (void (*termFunc)(void*), void* objAddr)
-  '__dyld_register_func_for_remove_image' => [0x1, 0, 0, 0, 1, 1],
-  '_dispatch_block_create' => [0, 0, 0, 0, 0, 2],
-  '_atexit_b' => [0, 0, 0, 0, 0, 2],
-  '_qsort_b' => [0, 0, 0, 0, 0, 2],
+  '__tlv_atexit' => [0x1, 0, 0, 0, 2, 1],                  # (void (*termFunc)(void*), void* objAddr); not in the T0 lists
 }.freeze
+# The callback-taking imports of the C++ runtime, ObjC and Foundation closures from the T0 facts scan: class, public prototype note.
+FIXTURE = File.readlines(File.join(root, 'tests/darling-arm64e-callback-imports.tsv'), chomp: true).drop(1).map { |l| l.split("\t") }
+              .to_h { |sym, cls, note, present| [sym, [cls, note, present]] }
+UNWIND = %w[__Unwind_RaiseException __Unwind_Resume __Unwind_DeleteException].freeze
+
+# What the facts say a symbol needs, derived here from the prototype note and not from the table
+def derived(sym, cls, note)
+  args = note.scan(/arg(\d+):[^:;]*:(fnptr|block)/)
+  return [0, 0, 0, 0, 0, 2] if UNWIND.include?(sym)
+  return [0, 0, 0, 0, 0, 3] unless cls == 'A'
+  return [0, 0, 0, 0, 0, 3] if args.any? { |_, k| k == 'block' } || args.any? { |i, _| i.to_i > 7 }
+  [args.sum { |i, _| 1 << i.to_i }, 0, 0, 0, args.map { |i, _| i.to_i }.max + 1, 1]
+end
+
+SPEC = HAND.dup
+FIXTURE.each { |sym, (cls, note, present)| SPEC[sym] ||= derived(sym, cls, note) if present == 'OK' }
+SPEC.freeze
 # the symbols the L4 set and the L2 probe import (plan shared-cache-m3-l4.md Q1)
 L4_AND_L2 = %w[___cxa_atexit _atexit _pthread_key_create _pthread_create _pthread_once __tlv_atexit _qsort _dispatch_async
                _dispatch_once __dyld_register_func_for_add_image _signal _sigaction __Block_copy].freeze
@@ -76,12 +90,13 @@ SHIM_MACHINE = <<~H
   #define CPU_SUBTYPE_ARM64E ((cpu_subtype_t) 2)
 H
 
-def build(root, dir, name, adapters_text: nil)
+def build(root, dir, name, adapters_text: nil, rows_text: nil)
   work = File.join(dir, name)
   FileUtils.mkdir_p(File.join(work, 'mach'))
   File.write(File.join(work, 'MachOLoaded.h'), SHIM_LOADED)
   File.write(File.join(work, 'mach', 'machine.h'), SHIM_MACHINE)
   FileUtils.cp(File.join(root, 'dyld3/DarlingArm64eAdapters.h'), work)
+  File.write(File.join(work, 'DarlingArm64eAdapterRows.inc'), rows_text || File.read(File.join(root, 'dyld3/DarlingArm64eAdapterRows.inc')))
   File.write(File.join(work, 'DarlingArm64eAdapters.cpp'), adapters_text || File.read(File.join(root, 'dyld3/DarlingArm64eAdapters.cpp')))
   File.write(File.join(work, 'sign.cpp'), "#include <stdint.h>\n#include <assert.h>\n#include \"MachOLoaded.h\"\nusing namespace dyld3;\n#{extract_sign_pointer(File.read(File.join(root, 'dyld3/MachOLoaded.cpp')))}")
   exe = File.join(work, 'host')
@@ -104,7 +119,17 @@ Dir.mktmpdir('darling-arm64e-adapters-') do |dir|
   out, = run(exe, 'rows')
   rows = out.lines.map { |l| l.split }.select { |f| f[0] == 'ROW' }.to_h { |f| [f[1], f[2..].map(&:to_i)] }
   check 'the table has exactly the rows of the spec', rows.keys.sort == SPEC.keys.sort, "extra #{(rows.keys - SPEC.keys).inspect} missing #{(SPEC.keys - rows.keys).inspect}"
-  SPEC.each { |sym, want| check "row #{sym} matches the Darwin prototype", rows[sym] == want, "#{rows[sym].inspect} want #{want.inspect}" if rows[sym] }
+  wrong = SPEC.reject { |sym, want| rows[sym] == want }
+  check "all #{SPEC.size} rows match the Darwin prototypes and the facts", wrong.empty?, wrong.first(3).map { |sym, want| "#{sym}: #{rows[sym].inspect} want #{want.inspect}" }.inspect
+  # the hand rows against the prototype notes, where the facts list them
+  HAND.each do |sym, want|
+    next unless FIXTURE[sym] && FIXTURE[sym][0] == 'A' && want[5] == 0 && want[1] == 0 && want[2] == 0
+    cls, note, = FIXTURE[sym]
+    check "#{sym}: the hand row names the argument that the prototype note names", cls == 'A' && note.scan(/arg(\d+):[^:;]*:fnptr/).sum { |i,| 1 << i.to_i } == want[0], note
+  end
+  # a callback-taking import with no row is a failure: every class A, S and D name of the facts that Darling has needs a row
+  missing = FIXTURE.select { |_, (_, _, present)| present == 'OK' }.keys - rows.keys
+  check "every callback-taking import of the facts (#{FIXTURE.count { |_, (_, _, p)| p == 'OK' }}) has a row", missing.empty?, missing.first(5).inspect
   check 'every symbol of the L4 set and the L2 probe has a row', (L4_AND_L2 - rows.keys).empty?, (L4_AND_L2 - rows.keys).inspect
   if (file = ENV['REQUIRED_SYMBOLS'])
     required = File.readlines(file).map(&:strip).reject { |l| l.empty? || l.start_with?('#') }
@@ -123,12 +148,12 @@ Dir.mktmpdir('darling-arm64e-adapters-') do |dir|
     bad = []
     (1..255).each do |mask|
       regs = (0..7).select { |i| mask[i] == 1 }
-      listing = (regs.size.odd? ? ["nop"] : []) + regs.map { |i| "xpaci x#{i}" } + ['ldr x16, #8', 'br x16']
+      listing = regs.flat_map { |i| ["add x16, x#{i}, #1", 'cmp x16, #2', 'b.ls #8', "autiza x#{i}"] } + ['ldr x16, #8', 'br x16']
       want = mc_words(listing.join("\n"))
-      got = run(exe, 'strip-thunk', mask.to_s)[0].split.map { |w| w.to_i(16) }
+      got = run(exe, 'auth-thunk', mask.to_s)[0].split.map { |w| w.to_i(16) }
       bad << mask unless want && got == want + [0x55667788, 0x11223344]
     end
-    check 'strip thunks of all 255 masks are what llvm-mc assembles (xpaci per register, ldr x16, br x16, literal)', bad.empty?, bad.first(5).inspect
+    check 'strip thunks of all 255 masks are what llvm-mc assembles (skip 0, 1 and -1, autiza per register, ldr x16, br x16, literal)', bad.empty?, bad.first(5).inspect
     %w[_dispatch_async _dispatch_once _sigaction _signal __Block_copy].each do |sym|
       o = run(exe, 'call-thunk', sym)[0].lines
       head = o.shift.split
@@ -158,42 +183,62 @@ Dir.mktmpdir('darling-arm64e-adapters-') do |dir|
 
   # ---------------------------------------------------------------- mutation probes: each must make the test fail
   source = File.read(File.join(root, 'dyld3/DarlingArm64eAdapters.cpp'))
+  rows_source = File.read(File.join(root, 'dyld3/DarlingArm64eAdapterRows.inc'))
+  # [text in the module, replacement] or [text in the rows file, replacement, :rows]
   mutants = {
-    'a strip thunk names the wrong register' => ['0xDAC143E0 | i', '0xDAC143E0 | (i + 1)'],
-    'a strip thunk loses its branch' => ['words[n++] = 0xD61F0200;', 'words[n++] = kNop;'],
-    'a strip thunk loses its padding nop' => ['if ( (__builtin_popcount(stripMask) & 1) != 0 )', 'if ( false )'],
-    'the strip is applied to the returned value instead of signing it' => ['result = signFunctionIA0(result);', 'result = stripCode(result);'],
-    'the call thunk ignores the strip mask' => ['a[i] = stripCode(a[i]);', 'a[i] = a[i];'],
-    'signal return values -1 are signed' => ['|| (pointer == ~0ULL)', ''],
-    'signal return values 0 and 1 are signed' => ['(pointer == 0) || (pointer == 1) ||', ''],
+    'an auth thunk names the wrong register' => ['0xDAC133E0 | i', '0xDAC133E0 | (i + 1)'],
+    'an auth thunk strips (xpaci) instead of authenticating' => ['0xDAC133E0 | i', '0xDAC143E0 | i'],
+    'an auth thunk authenticates 0, 1 and -1 too' => ['0x54000049;', '0xD503201F;'],
+    'an auth thunk loses its branch' => ['words[n++] = 0xD61F0200;', 'words[n++] = kNop;'],
+    'the call thunk strips instead of authenticating a code pointer' => ['a[i] = authenticateFunction(a[i]);', 'a[i] = stripCode(a[i]);'],
+    'a code pointer of 0, 1 or -1 is authenticated' => ['return isSpecialHandler(pointer) ? pointer : authenticateIA(pointer, 0);', 'return authenticateIA(pointer, 0);'],
+    'a block invoke is stripped instead of authenticated' => ['const uint64_t plainInvoke = authenticateIA((uint64_t)block->invoke, (uint64_t)&block->invoke);', 'const uint64_t plainInvoke = stripCode((uint64_t)block->invoke);'],
+    'a block invoke is authenticated with discriminator 0 instead of its address' => ['const uint64_t plainInvoke = authenticateIA((uint64_t)block->invoke, (uint64_t)&block->invoke);', 'const uint64_t plainInvoke = authenticateIA((uint64_t)block->invoke, 0);'],
     'a stack block does not get its signature back' => ['*restoreSlot = restoreValue;', '(void)restoreValue;'],
     'a stack block is never restored (slot not recorded)' => ['restoreSlot = &block->invoke;', 'restoreSlot = nullptr;'],
-    'a global block is stripped in place' => ['a[row->blockArg - 1] = (uint64_t)mirrorOfGlobalBlock(block);', 'block->invoke = (void*)stripCode((uint64_t)block->invoke);'],
-    'a global block mirror is not stripped' => ['copy->invoke = (void*)stripCode((uint64_t)block->invoke);', ''],
-    'Block_copy re-signs without address diversity' => ['&block->invoke, true, 0, 0)', 'nullptr, false, 0, 0)'],
-    'Block_copy re-signs a global block in place' => ['if ( (block->flags & kBlockIsGlobal) == 0 )', 'if ( true )'],
-    'Block_copy does not strip before it signs' => ['signPointer(stripCode((uint64_t)block->invoke), &block->invoke', 'signPointer((uint64_t)block->invoke, &block->invoke'],
+    'a global block is authenticated in place' => ['a[row->blockArg - 1] = (uint64_t)mirrorOfGlobalBlock(block, plainInvoke);', 'block->invoke = (void*)plainInvoke;'],
+    'a global block mirror keeps the signed invoke' => ['copy->invoke = (void*)plainInvoke;', ''],
+    'Block_copy signs the copy without authenticating the original' => ['originalInvoke = authenticateIA((uint64_t)block->invoke, (uint64_t)&block->invoke);', 'originalInvoke = stripCode((uint64_t)block->invoke);'],
+    'Block_copy signs the copy after a failed authentication' => ['&& authenticated(originalInvoke) ) {', ') {'],
+    'Block_copy rewrites a block that was only retained' => ['&& (result != originalBlock)', ''],
+    'Block_copy re-signs without address diversity' => ['&copy->invoke, true, 0, 0)', 'nullptr, false, 0, 0)'],
+    'signal signs a handler that nobody installed through an adapter' => ['if ( !isSpecialHandler(result) && wasInstalledHere(a[0], result) )', 'if ( !isSpecialHandler(result) )'],
+    'signal signs SIG_IGN and SIG_ERR' => ['if ( !isSpecialHandler(result) && wasInstalledHere(a[0], result) )', 'if ( wasInstalledHere(a[0], result) || (result == 1) || (result == ~0ULL) )'],
+    'signal does not remember the handler it installed' => ['recordInstalledHandler(a[0], a[1]);', ''],
+    'signal remembers a handler whose installation failed' => ['if ( result != ~0ULL )', 'if ( true )'],
+    'a handler that failed authentication is remembered' => ['|| !authenticated(plainHandler) )', ') '],
+    'sigaction does not remember the handler it installed' => ['recordInstalledHandler(a[0], structCopy[0]);', ''],
+    'sigaction judges its int result by the whole register' => ['((int)result == 0)', '(result == 0)'],
+    'sigaction strips the handler instead of authenticating it' => ['structCopy[0] = authenticateFunction(structCopy[0]);', 'structCopy[0] = stripCode(structCopy[0]);'],
     'sigaction hands the caller\'s struct to the callee' => ['a[row->structArg - 1] = (uint64_t)structCopy;', ''],
-    'sigaction does not strip the handler' => ['structCopy[0] = stripCode(structCopy[0]);', ''],
+    'a thunk page is left read-write-execute by the seal' => ['PROT_READ | PROT_EXEC) == 0', 'PROT_READ | PROT_WRITE | PROT_EXEC) == 0'],
+    'a thunk page is mapped writable and executable' => ['mmap(nullptr, kThunkPageSize, PROT_READ | PROT_WRITE,', 'mmap(nullptr, kThunkPageSize, PROT_READ | PROT_WRITE | PROT_EXEC,'],
+    'a thunk page is never sealed' => ['if ( !sealExecutablePage(page, kThunkPageSize) ) {', 'if ( false ) {'],
     'a thunk is made again for the same row and target' => ['(sThunks[i].real == real) )', '(sThunks[i].real == real) && false )'],
     'an unsupported row is bound as if supported' => [/if \( row->status == AdapterStatus::Unsupported \) \{(\s+dyld::warn)/, 'if ( false ) {\1'],
+    'a handled-elsewhere row warns or is thunked' => [/if \( row->status == AdapterStatus::HandledElsewhere \)\s+return target;\n/, ''],
     'an arm64e target is thunked' => ['if ( !sEnabled || targetIsArm64e )', 'if ( !sEnabled )'],
     'the kill switch does nothing' => ['if ( !sEnabled || targetIsArm64e )', 'if ( targetIsArm64e )'],
-    'the row of _atexit strips the wrong argument' => [/("_atexit",\s*)0x1,/, '\10x2,'],
-    'the row of _pthread_create strips the wrong argument' => [/("_pthread_create",\s*)0x4,/, '\10x2,'],
-    'the row of _signal is missing its return fix' => ['0x2, 0, 0, ReturnFix::SignFunctionIA0,', '0x2, 0, 0, ReturnFix::None,'],
-    'the row of _qsort is dropped' => [/^\t\{ "_qsort",.*\n/, ''],
     'the validator accepts a nine-argument row' => ['(r.argCount > 8)', '(r.argCount > 9)'],
     'the validator accepts a duplicate symbol' => ['return "a symbol has two rows";', ''],
+    'the row of _atexit authenticates the wrong argument' => ['{ "_atexit", 0x1,', '{ "_atexit", 0x2,', :rows],
+    'the row of _pthread_create authenticates the wrong argument' => ['{ "_pthread_create", 0x4,', '{ "_pthread_create", 0x2,', :rows],
+    'the row of _signal has no return fix' => ['0x2, 0, 0, ReturnFix::SignInstalledHandler,', '0x2, 0, 0, ReturnFix::None,', :rows],
+    'the row of _qsort is dropped' => [/^\t\{ "_qsort",.*\n/, '', :rows],
+    'a row of the facts (_glob) is dropped' => [/^\t\{ "_glob",.*\n/, '', :rows],
+    'a row of the facts (_dispatch_after_f) has the wrong argument' => ['{ "_dispatch_after_f", 0x8,', '{ "_dispatch_after_f", 0x4,', :rows],
+    'a block-taking import of the facts (_dispatch_after) is made a shape-only strip' => [/\{ "_dispatch_after", 0x0, 0, 0, ReturnFix::None, 0, AdapterStatus::Unsupported/, '{ "_dispatch_after", 0x4, 0, 0, ReturnFix::None, 3, AdapterStatus::ShapeOnly', :rows],
+    'the _Unwind_Resume row is unsupported (it would warn on every C++ program)' => [/\{ "__Unwind_Resume", 0x0, 0, 0, ReturnFix::None, 0, AdapterStatus::HandledElsewhere/, '{ "__Unwind_Resume", 0x0, 0, 0, ReturnFix::None, 0, AdapterStatus::Unsupported', :rows],
   }
   killed = 0
-  mutants.each_with_index do |(desc, (from, to)), i|
-    unless source.scan(from).size == 1
-      check "mutant applies: #{desc}", false, "#{source.scan(from).size} matches"
+  mutants.each_with_index do |(desc, (from, to, where)), i|
+    text = where == :rows ? rows_source : source
+    unless text.scan(from).size == 1
+      check "mutant applies: #{desc}", false, "#{text.scan(from).size} matches"
       next
     end
-    mutated = from.is_a?(Regexp) ? source.sub(from, to) : source.sub(from) { to }
-    mexe, merr = build(root, dir, "mutant#{i}", adapters_text: mutated)
+    mutated = from.is_a?(Regexp) ? text.sub(from, to) : text.sub(from) { to }
+    mexe, merr = build(root, dir, "mutant#{i}", adapters_text: (where == :rows ? nil : mutated), rows_text: (where == :rows ? mutated : nil))
     dead = mexe.nil? || begin
       mout, mst = run(mexe)
       !mst.success? || mout =~ /^FAIL/
@@ -205,8 +250,8 @@ Dir.mktmpdir('darling-arm64e-adapters-') do |dir|
       # a thunk-shape mutant that the native run does not see is still caught by the assembler comparison
       bad = (1..255).any? do |mask|
         regs = (0..7).select { |b| mask[b] == 1 }
-        want = mc_words(((regs.size.odd? ? ['nop'] : []) + regs.map { |b| "xpaci x#{b}" } + ['ldr x16, #8', 'br x16']).join("\n"))
-        run(mexe, 'strip-thunk', mask.to_s)[0].split.map { |w| w.to_i(16) } != want + [0x55667788, 0x11223344]
+        want = mc_words((regs.flat_map { |b| ["add x16, x#{b}, #1", 'cmp x16, #2', 'b.ls #8', "autiza x#{b}"] } + ['ldr x16, #8', 'br x16']).join("\n"))
+        run(mexe, 'auth-thunk', mask.to_s)[0].split.map { |w| w.to_i(16) } != want + [0x55667788, 0x11223344]
       end
       bytes_dead = bad
     end

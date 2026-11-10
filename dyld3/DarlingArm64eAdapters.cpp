@@ -18,26 +18,8 @@ namespace darling {
 
 using AdapterSign = dyld3::MachOLoaded::ChainedFixupPointerOnDisk::Arm64e;
 
-// The evidence strings name the checks of tests/arm64e-link/abi (L2 ABI probe), which stripped (01-10, 18) or
-// re-signed (17, 19) exactly these pointers and passed in 6 of 6 boots.
 static const AdapterRow kRows[] = {
-	{ "___cxa_atexit",		0x1, 0, 0, ReturnFix::None, 3, AdapterStatus::Probed,    "L2 check 02" },
-	{ "_atexit",			0x1, 0, 0, ReturnFix::None, 1, AdapterStatus::Probed,    "L2 check 01" },
-	{ "_pthread_key_create",0x2, 0, 0, ReturnFix::None, 2, AdapterStatus::Probed,    "L2 check 03" },
-	{ "_pthread_create",	0x4, 0, 0, ReturnFix::None, 4, AdapterStatus::Probed,    "L2 check 04" },
-	{ "_pthread_once",		0x2, 0, 0, ReturnFix::None, 2, AdapterStatus::Probed,    "L2 check 05" },
-	{ "_qsort",				0x8, 0, 0, ReturnFix::None, 4, AdapterStatus::Probed,    "L2 check 06" },
-	{ "__dyld_register_func_for_add_image", 0x1, 0, 0, ReturnFix::None, 1, AdapterStatus::Probed, "L2 check 10" },
-	{ "_dispatch_async",	0x0, 2, 0, ReturnFix::None, 2, AdapterStatus::Probed,    "L2 checks 07, 08 (stack and global block; a heap block is stripped in place and stays stripped)" },
-	{ "_dispatch_once",		0x0, 2, 0, ReturnFix::None, 2, AdapterStatus::Probed,    "L2 check 09" },
-	{ "_sigaction",			0x0, 0, 2, ReturnFix::None, 3, AdapterStatus::Probed,    "L2 check 18 (the old-action out parameter is not re-signed: not shown)" },
-	{ "_signal",			0x2, 0, 0, ReturnFix::SignFunctionIA0, 2, AdapterStatus::Probed, "L2 check 19" },
-	{ "__Block_copy",		0x0, 0, 0, ReturnFix::ResignBlockInvoke, 1, AdapterStatus::Probed, "L2 check 17" },
-	{ "__tlv_atexit",		0x1, 0, 0, ReturnFix::None, 2, AdapterStatus::ShapeOnly, "the shape of checks 01 and 03, not run" },
-	{ "__dyld_register_func_for_remove_image", 0x1, 0, 0, ReturnFix::None, 1, AdapterStatus::ShapeOnly, "the shape of check 10, not run" },
-	{ "_dispatch_block_create",	0, 0, 0, ReturnFix::None, 0, AdapterStatus::Unsupported, "a block returned to arm64e code: the key and diversifier of what plain code builds are not shown (L2 README, Not verified)" },
-	{ "_atexit_b",			0, 0, 0, ReturnFix::None, 0, AdapterStatus::Unsupported, "block arguments other than dispatch_async and dispatch_once are not shown (L2 README, Not verified)" },
-	{ "_qsort_b",			0, 0, 0, ReturnFix::None, 0, AdapterStatus::Unsupported, "block arguments other than dispatch_async and dispatch_once are not shown (L2 README, Not verified)" },
+#include "DarlingArm64eAdapterRows.inc"
 };
 
 // A Block_literal_1. flags: 1<<24 BLOCK_NEEDS_FREE (heap), 1<<28 BLOCK_IS_GLOBAL.
@@ -52,13 +34,39 @@ static_assert(sizeof(BlockLiteral) == 32, "block literal layout");
 static const int32_t kBlockNeedsFree = 1 << 24;
 static const int32_t kBlockIsGlobal  = 1 << 28;
 
-// XPACI: the identity on an unsigned canonical pointer, so one strip serves signed and plain callers alike.
+// The plain arm64 assembler of this build refuses the PAC mnemonics, so these are .inst words on x17 and x16.
+// XPACI is only used to tell a pointer that authenticated (canonical, so stripping changes nothing) from one that did not.
 static inline uint64_t stripCode(uint64_t pointer)
 {
 	uint64_t stripped;
-	// the .inst form because the plain arm64 assembler of this build refuses xpaci; this is xpaci x17
-	__asm__("mov x17, %1\n\t.inst 0xDAC143F1\n\tmov %0, x17" : "=r"(stripped) : "r"(pointer) : "x17");
+	__asm__("mov x17, %1\n\t.inst 0xDAC143F1\n\tmov %0, x17" : "=r"(stripped) : "r"(pointer) : "x17");	// xpaci x17
 	return stripped;
+}
+
+// AUTIA with the modifier in a register. Without FPAC a failed authentication returns a pointer with error bits and
+// the later call through it faults; with FPAC the instruction itself faults.
+static inline uint64_t authenticateIA(uint64_t pointer, uint64_t modifier)
+{
+	uint64_t result;
+	__asm__("mov x17, %1\n\tmov x16, %2\n\t.inst 0xDAC11211\n\tmov %0, x17" : "=r"(result) : "r"(pointer), "r"(modifier) : "x16", "x17");	// autia x17, x16
+	return result;
+}
+
+static inline bool authenticated(uint64_t result)
+{
+	return result == stripCode(result);
+}
+
+static inline bool isSpecialHandler(uint64_t value)
+{
+	// NULL, SIG_IGN, SIG_ERR: never signed, never authenticated
+	return (value == 0) || (value == 1) || (value == ~0ULL);
+}
+
+// a function pointer: key IA, discriminator 0 (what paciza makes, and the compiler for a C function pointer)
+static inline uint64_t authenticateFunction(uint64_t pointer)
+{
+	return isSpecialHandler(pointer) ? pointer : authenticateIA(pointer, 0);
 }
 
 static bool sEnabled = true;
@@ -95,25 +103,25 @@ const char* validateAdapterRows(const AdapterRow* rows, size_t count)
 		}
 		if ( (r.evidence == nullptr) || (r.evidence[0] == '\0') )
 			return "a row has no evidence";
-		const bool acts = (r.stripMask != 0) || (r.blockArg != 0) || (r.structArg != 0) || (r.ret != ReturnFix::None);
-		if ( r.status == AdapterStatus::Unsupported ) {
+		const bool acts = (r.authMask != 0) || (r.blockArg != 0) || (r.structArg != 0) || (r.ret != ReturnFix::None);
+		if ( (r.status == AdapterStatus::Unsupported) || (r.status == AdapterStatus::HandledElsewhere) ) {
 			if ( acts )
-				return "an unsupported row has an action";
+				return "a row without an adapter has an action";
 			continue;
 		}
 		if ( !acts )
 			return "a row does nothing";
 		if ( (r.argCount == 0) || (r.argCount > 8) )
 			return "a row takes no register argument or more than eight";
-		if ( (r.stripMask >> r.argCount) != 0 )
+		if ( (r.authMask >> r.argCount) != 0 )
 			return "a strip mask names an argument the row does not have";
 		if ( (r.blockArg > r.argCount) || (r.structArg > r.argCount) )
 			return "a block or struct argument is out of range";
 		if ( (r.blockArg != 0) && (r.structArg != 0) )
 			return "a row has both a block and a struct argument";
-		if ( (r.blockArg != 0) && ((r.stripMask >> (r.blockArg - 1)) & 1) )
+		if ( (r.blockArg != 0) && ((r.authMask >> (r.blockArg - 1)) & 1) )
 			return "the block argument is also in the strip mask";
-		if ( (r.structArg != 0) && ((r.stripMask >> (r.structArg - 1)) & 1) )
+		if ( (r.structArg != 0) && ((r.authMask >> (r.structArg - 1)) & 1) )
 			return "the struct argument is also in the strip mask";
 	}
 	return nullptr;
@@ -129,20 +137,22 @@ static void putLiteral(uint32_t* words, uint64_t value)
 	words[1] = (uint32_t)(value >> 32);
 }
 
-// xpaci xN for each masked argument, then a tail branch: no frame, no stack, the link register stays the caller's.
-size_t emitStripThunk(uint32_t* words, uint8_t stripMask, uint64_t real)
+// For each masked argument: leave 0, 1 and -1 alone, else autiza xN (key IA, zero discriminator); then a tail branch. No
+// frame, no stack, the link register stays the caller's. x16 and the flags are scratch at a call boundary.
+size_t emitAuthThunk(uint32_t* words, uint8_t authMask, uint64_t real)
 {
 	size_t n = 0;
-	// the literal is 8 bytes after the ldr and must be 8 aligned
-	if ( (__builtin_popcount(stripMask) & 1) != 0 )
-		words[n++] = kNop;
 	for (unsigned i = 0; i != 8; ++i) {
-		if ( (stripMask >> i) & 1 )
-			words[n++] = 0xDAC143E0 | i;
+		if ( ((authMask >> i) & 1) == 0 )
+			continue;
+		words[n++] = 0x91000410 | (i << 5);		// add x16, xi, #1: 0, -1 and 1 become 1, 0 and 2
+		words[n++] = 0xF1000A1F;				// cmp x16, #2
+		words[n++] = 0x54000049;				// b.ls +8
+		words[n++] = 0xDAC133E0 | i;			// autiza xi
 	}
 	words[n++] = 0x58000050;	// ldr x16, #8
 	words[n++] = 0xD61F0200;	// br x16
-	putLiteral(&words[n], real);
+	putLiteral(&words[n], real);	// 4 words per argument and two more: the literal is 8 aligned
 	return n + 2;
 }
 
@@ -179,15 +189,18 @@ size_t emitCallThunk(uint32_t* words, const AdapterRow* row, uint64_t real)
 	return 20;
 }
 
-// One page of executable thunks, filled once and never rewritten. Linux ignores W^X, so the page is mapped writable
-// and executable once and no thread ever finds a thunk's page without execute permission.
-static const size_t kThunkPageSize = 16384;
-static uint8_t* sThunkPage;
-static size_t sThunkUsed;
+// Thunks are never in a page that is writable and executable at once. Each new thunk gets its own page: mapped read-write,
+// filled, flushed and sealed read-execute, and never written again. Thunks are made as images bind, so one shared page
+// would have to be reopened for writing while other threads may already be running thunks in it. The cost is one page
+// per distinct adapted symbol and target (at most one per table row in practice). The pool is the cache below, which
+// holds the lock; it only ever grows, and a hit reads an entry that is complete and a sealed page.
+static const size_t kThunkPageSize = 16384;		// the largest page size of the hosts (Asahi has 16 KiB)
 
 struct ThunkEntry { const AdapterRow* row; uint64_t real; uint64_t thunk; };
 static ThunkEntry sThunks[128];
 static size_t sThunkCount;
+// dyld's lock is held by every caller; this one also keeps a bind from another thread out of the cache and the page
+static volatile int sThunkLock;
 
 static void flushInstructionCache(void* start, size_t length)
 {
@@ -204,8 +217,14 @@ static void flushInstructionCache(void* start, size_t length)
 	__asm__ volatile("dsb ish\n\tisb" : : : "memory");
 }
 
-// 0 when the page cannot be had
-static uint64_t emitThunk(const AdapterRow* row, uint64_t real)
+bool sealExecutablePage(void* page, size_t length)
+{
+	flushInstructionCache(page, length);
+	return mprotect(page, length, PROT_READ | PROT_EXEC) == 0;
+}
+
+// 0 when no page can be had
+static uint64_t emitThunkLocked(const AdapterRow* row, uint64_t real)
 {
 	for (size_t i = 0; i != sThunkCount; ++i) {
 		if ( (sThunks[i].row == row) && (sThunks[i].real == real) )
@@ -213,36 +232,39 @@ static uint64_t emitThunk(const AdapterRow* row, uint64_t real)
 	}
 	if ( sThunkCount == sizeof(sThunks) / sizeof(sThunks[0]) )
 		return 0;
-	if ( sThunkPage == nullptr ) {
-		void* page = mmap(nullptr, kThunkPageSize, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON, -1, 0);
-		if ( page == MAP_FAILED )
-			return 0;
-		sThunkPage = (uint8_t*)page;
-	}
-	uint32_t words[20];
+	uint32_t words[40];
 	const bool simple = (row->blockArg == 0) && (row->structArg == 0) && (row->ret == ReturnFix::None);
-	const size_t count = simple ? emitStripThunk(words, row->stripMask, real) : emitCallThunk(words, row, real);
-	const size_t bytes = (count * sizeof(uint32_t) + 15) & ~(size_t)15;
-	if ( sThunkUsed + bytes > kThunkPageSize )
+	const size_t count = simple ? emitAuthThunk(words, row->authMask, real) : emitCallThunk(words, row, real);
+	void* page = mmap(nullptr, kThunkPageSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+	if ( page == MAP_FAILED )
 		return 0;
-	uint8_t* at = sThunkPage + sThunkUsed;
-	memcpy(at, words, count * sizeof(uint32_t));
-	flushInstructionCache(at, count * sizeof(uint32_t));
-	sThunkUsed += bytes;
-	sThunks[sThunkCount++] = { row, real, (uint64_t)at };
-	return (uint64_t)at;
+	memcpy(page, words, count * sizeof(uint32_t));
+	if ( !sealExecutablePage(page, kThunkPageSize) ) {
+		munmap(page, kThunkPageSize);
+		return 0;
+	}
+	sThunks[sThunkCount++] = { row, real, (uint64_t)page };
+	return (uint64_t)page;
+}
+
+static uint64_t emitThunk(const AdapterRow* row, uint64_t real)
+{
+	while ( __sync_lock_test_and_set(&sThunkLock, 1) ) { }
+	const uint64_t thunk = emitThunkLocked(row, real);
+	__sync_lock_release(&sThunkLock);
+	return thunk;
 }
 
 // ------------------------------------------------------------------------------------------ the call thunk's work
 
-// The mirror of a global block: its literal can be read-only, so a stripped copy is what plain code gets. Global
-// blocks are never freed, so the mirrors are kept, one per block address, and refreshed on every use.
+// The mirror of a global block: its literal can be read-only, so plain code gets a copy with the invoke authenticated.
+// Global blocks are never freed, so the mirrors are kept, one per block address, and refreshed on every use.
 struct Mirror { const BlockLiteral* original; BlockLiteral* copy; };
 static Mirror sMirrors[256];
 static size_t sMirrorCount;
 static volatile int sMirrorLock;
 
-static BlockLiteral* mirrorOfGlobalBlock(const BlockLiteral* block)
+static BlockLiteral* mirrorOfGlobalBlock(const BlockLiteral* block, uint64_t plainInvoke)
 {
 	while ( __sync_lock_test_and_set(&sMirrorLock, 1) ) { }
 	BlockLiteral* copy = nullptr;
@@ -261,17 +283,35 @@ static BlockLiteral* mirrorOfGlobalBlock(const BlockLiteral* block)
 		sMirrors[sMirrorCount++] = { block, copy };
 	}
 	*copy = *block;
-	copy->invoke = (void*)stripCode((uint64_t)block->invoke);
+	copy->invoke = (void*)plainInvoke;
 	__sync_lock_release(&sMirrorLock);
 	return copy;
 }
 
-static uint64_t signFunctionIA0(uint64_t pointer)
+// The handler that each signal was last given through a signal or sigaction row (already authenticated, so plain code
+// has it as it is), so that signal() can sign what it hands back only when arm64e code installed it. A signal() that
+// races another one can leave a stale entry; the effect is an unsigned result, which faults when it is called.
+static const unsigned kSignalCount = 32;
+static uint64_t sInstalledHandlers[kSignalCount];
+static volatile int sHandlerLock;
+
+static void recordInstalledHandler(uint64_t signalNumber, uint64_t plainHandler)
 {
-	// SIG_DFL, SIG_IGN and SIG_ERR are not code
-	if ( (pointer == 0) || (pointer == 1) || (pointer == ~0ULL) )
-		return pointer;
-	return AdapterSign::signPointer(pointer, nullptr, false, 0, 0);
+	if ( (signalNumber == 0) || (signalNumber >= kSignalCount) || !authenticated(plainHandler) )
+		return;
+	while ( __sync_lock_test_and_set(&sHandlerLock, 1) ) { }
+	sInstalledHandlers[signalNumber] = plainHandler;
+	__sync_lock_release(&sHandlerLock);
+}
+
+static bool wasInstalledHere(uint64_t signalNumber, uint64_t handler)
+{
+	if ( (signalNumber == 0) || (signalNumber >= kSignalCount) )
+		return false;
+	while ( __sync_lock_test_and_set(&sHandlerLock, 1) ) { }
+	const bool same = (sInstalledHandlers[signalNumber] == handler);
+	__sync_lock_release(&sHandlerLock);
+	return same;
 }
 
 typedef uint64_t (*Call8)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
@@ -281,24 +321,27 @@ static uint64_t callRow(uint64_t* regs, const AdapterRow* row, uint64_t real)
 	uint64_t a[8];
 	memcpy(a, regs, sizeof(a));
 	for (unsigned i = 0; i != 8; ++i) {
-		if ( (row->stripMask >> i) & 1 )
-			a[i] = stripCode(a[i]);
+		if ( (row->authMask >> i) & 1 )
+			a[i] = authenticateFunction(a[i]);
 	}
 
-	// a stack block that the callee copies or runs before it returns gets its own signature back afterwards
+	// An address-diversified invoke is authenticated with the address of its own field. A stack block that the callee
+	// copies or runs before it returns gets its signature back afterwards; a heap block stays authenticated, so arm64e
+	// code that calls that same object itself later faults (not shown by the probe: L2 checks 07-09 use stack and global blocks).
 	void** restoreSlot = nullptr;
 	void* restoreValue = nullptr;
 	if ( (row->blockArg != 0) && (a[row->blockArg - 1] != 0) ) {
 		BlockLiteral* block = (BlockLiteral*)a[row->blockArg - 1];
+		const uint64_t plainInvoke = authenticateIA((uint64_t)block->invoke, (uint64_t)&block->invoke);
 		if ( block->flags & kBlockIsGlobal ) {
-			a[row->blockArg - 1] = (uint64_t)mirrorOfGlobalBlock(block);
+			a[row->blockArg - 1] = (uint64_t)mirrorOfGlobalBlock(block, plainInvoke);
 		}
 		else {
 			if ( (block->flags & kBlockNeedsFree) == 0 ) {
 				restoreSlot = &block->invoke;
 				restoreValue = block->invoke;
 			}
-			block->invoke = (void*)stripCode((uint64_t)block->invoke);
+			block->invoke = (void*)plainInvoke;
 		}
 	}
 
@@ -306,26 +349,42 @@ static uint64_t callRow(uint64_t* regs, const AdapterRow* row, uint64_t real)
 	uint64_t structCopy[2];
 	if ( (row->structArg != 0) && (a[row->structArg - 1] != 0) ) {
 		memcpy(structCopy, (const void*)a[row->structArg - 1], sizeof(structCopy));
-		structCopy[0] = stripCode(structCopy[0]);
+		structCopy[0] = authenticateFunction(structCopy[0]);
 		a[row->structArg - 1] = (uint64_t)structCopy;
 	}
 
+	// Block_copy: the original's signature is checked before anything is signed for the copy
+	uint64_t originalBlock = 0, originalInvoke = 0;
+	if ( (row->ret == ReturnFix::ResignCopiedBlock) && (a[0] != 0) ) {
+		const BlockLiteral* block = (const BlockLiteral*)a[0];
+		originalBlock = a[0];
+		originalInvoke = authenticateIA((uint64_t)block->invoke, (uint64_t)&block->invoke);
+	}
+
+	// the handler that signal() replaces is looked up before this call records the new one
 	uint64_t result = ((Call8)real)(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
 
 	if ( restoreSlot != nullptr )
 		*restoreSlot = restoreValue;
+	if ( row->structArg != 0 ) {
+		// sigaction returned 0: the handler in act is the one installed
+		if ( ((int)result == 0) && (a[row->structArg - 1] != 0) )
+			recordInstalledHandler(a[0], structCopy[0]);
+	}
 	switch ( row->ret ) {
 		case ReturnFix::None:
 			break;
-		case ReturnFix::SignFunctionIA0:
-			result = signFunctionIA0(result);
+		case ReturnFix::SignInstalledHandler:
+			if ( !isSpecialHandler(result) && wasInstalledHere(a[0], result) )
+				result = AdapterSign::signPointer(result, nullptr, false, 0, 0);
+			if ( result != ~0ULL )
+				recordInstalledHandler(a[0], a[1]);
 			break;
-		case ReturnFix::ResignBlockInvoke:
-			if ( result != 0 ) {
-				BlockLiteral* block = (BlockLiteral*)result;
-				// a global block is returned as it is, and its literal is the image's own, already signed
-				if ( (block->flags & kBlockIsGlobal) == 0 )
-					block->invoke = (void*)AdapterSign::signPointer(stripCode((uint64_t)block->invoke), &block->invoke, true, 0, 0);
+		case ReturnFix::ResignCopiedBlock:
+			// a copy was made when the result is another block than the argument (a global or heap block comes back as it is, and is not written); a failed authentication signs nothing
+			if ( (originalBlock != 0) && (result != 0) && (result != originalBlock) && authenticated(originalInvoke) ) {
+				BlockLiteral* copy = (BlockLiteral*)result;
+				copy->invoke = (void*)AdapterSign::signPointer(originalInvoke, &copy->invoke, true, 0, 0);
 			}
 			break;
 	}
@@ -340,6 +399,8 @@ uint64_t adaptedTarget(const char* symbol, uint64_t target, bool targetIsArm64e)
 		return target;
 	const AdapterRow* row = findAdapterRow(symbol);
 	if ( row == nullptr )
+		return target;
+	if ( row->status == AdapterStatus::HandledElsewhere )
 		return target;
 	if ( row->status == AdapterStatus::Unsupported ) {
 		dyld::warn("arm64e adapters: %s is imported by an arm64e image and has no adapter (%s); calls with a signed pointer fault\n",
@@ -362,7 +423,7 @@ const AdapterRow* adapterRows(size_t* count) { *count = 0; return kRows; }
 const AdapterRow* findAdapterRow(const char*) { return nullptr; }
 const char* validateAdapterRows(const AdapterRow*, size_t) { return nullptr; }
 uint64_t adaptedTarget(const char*, uint64_t target, bool) { return target; }
-size_t emitStripThunk(uint32_t*, uint8_t, uint64_t) { return 0; }
+size_t emitAuthThunk(uint32_t*, uint8_t, uint64_t) { return 0; }
 size_t emitCallThunk(uint32_t*, const AdapterRow*, uint64_t) { return 0; }
 uint64_t callThunkHelperAddress() { return 0; }
 
