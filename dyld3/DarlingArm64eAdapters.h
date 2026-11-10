@@ -57,8 +57,10 @@ uint64_t adaptedTarget(const char* symbol, uint64_t target, bool targetIsArm64e)
 // DYLD_DARLING_ARM64E_ADAPTERS=off: bind the raw targets, as before the adapters existed.
 void setAdaptersEnabled(bool enabled);
 
-// The thunk bytes, exposed so a test can compare them with an assembler. Returns the number of words written.
+// The thunk bytes, exposed so a test can compare them with an assembler. Both return the number of words written.
 size_t emitStripThunk(uint32_t* words, uint8_t stripMask, uint64_t real);
+size_t emitCallThunk(uint32_t* words, const AdapterRow* row, uint64_t real);
+uint64_t callThunkHelperAddress();
 
 } // namespace darling
 } // namespace dyld3
