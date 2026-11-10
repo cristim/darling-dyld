@@ -20,7 +20,9 @@ for c in ${L4_CONFIGS:-c1 c2 c3 selftest}; do
     c1) cmd="$cmd; PROBE_CONFIG=c1 \$C" ;;
     c2) cmd="$cmd; PROBE_CONFIG=c2 \$E" ;;
     c3) : "${CACHE_DIR:?c3 needs CACHE_DIR}"
-        cmd="$cmd; PROBE_CONFIG=c3 DYLD_SHARED_CACHE_SPLIT_DIR=${GUEST_ROOT:-/Volumes/SystemRoot}$(cd "$CACHE_DIR" && pwd) \$E" ;;
+        pol=""
+        if [ -n "${L4_POLICY:-}" ]; then pol="DYLD_SHARED_CACHE_SPLIT_POLICY=${GUEST_ROOT:-/Volumes/SystemRoot}$(cd "$(dirname "$L4_POLICY")" && pwd)/$(basename "$L4_POLICY")"; fi
+        cmd="$cmd; PROBE_CONFIG=c3 DYLD_SHARED_CACHE_SPLIT_DIR=${GUEST_ROOT:-/Volumes/SystemRoot}$(cd "$CACHE_DIR" && pwd) $pol ${L4_EXTRA_ENV:-} \$E" ;;
     selftest) cmd="$cmd; \$E selftest; \$C selftest" ;;
     *) echo "unknown config $c" >&2; exit 2 ;;
   esac
