@@ -861,6 +861,22 @@ uintptr_t ImageLoaderMachOCompressed::resolve(const LinkContext& context, const 
 	return symbolAddress;
 }
 
+#ifdef DARLING
+// EXPERIMENT (local branch exp/l4-reverse-adapters): true when `address` lies in an executable segment of an image that is
+// loaded now. findImageContainingAddress reads the mapped-range list without a lock, like dlsym and dladdr do.
+static bool darlingAddressIsCode(uint64_t address)
+{
+	const ImageLoader* image = dyld::findImageContainingAddress((const void*)address);
+	if ( image == NULL )
+		return false;
+	for (unsigned i = 0, n = image->segmentCount(); i != n; ++i) {
+		if ( image->segExecutable(i) && (address >= image->segActualLoadAddress(i)) && (address < image->segActualEndAddress(i)) )
+			return true;
+	}
+	return false;
+}
+#endif
+
 uintptr_t ImageLoaderMachOCompressed::bindAt(const LinkContext& context, ImageLoaderMachOCompressed* image,
 											 uintptr_t addr, uint8_t type, const char* symbolName,
 											 uint8_t symbolFlags, intptr_t addend, long libraryOrdinal,
@@ -877,6 +893,13 @@ uintptr_t ImageLoaderMachOCompressed::bindAt(const LinkContext& context, ImageLo
         targetImage = nullptr;
     } else
         symbolAddress = image->resolve(context, symbolName, symbolFlags, libraryOrdinal, &targetImage, patcher, last, runResolver);
+#ifdef DARLING
+	// EXPERIMENT: a plain image binding an export of an arm64e image (the shared cache's libc++abi) gets a thunk that signs
+	// the code pointers it passes and strips the ones it receives; an address outside the target image is an interposer's
+	if ( (type != BIND_TYPE_THREADED_REBASE) && (addend == 0) && (targetImage != NULL) && targetImage->containsAddress((void*)symbolAddress)
+	  && !dyld3::darling::cpusubtypeIsArm64e(image->machHeader()->cpusubtype) )
+		symbolAddress = dyld3::darling::reverseAdaptedTarget(symbolName, symbolAddress, dyld3::darling::cpusubtypeIsArm64e(targetImage->machHeader()->cpusubtype), &darlingAddressIsCode);
+#endif
 
 	// do actual update
 	return image->bindLocation(context, image->imageBaseAddress(), addr, symbolAddress, type, symbolName, addend, image->getPath(), targetImage ? targetImage->getPath() : NULL, msg, extraBindData, image->fSlide);
@@ -1052,6 +1075,9 @@ void ImageLoaderMachOCompressed::doApplyFixups(const LinkContext& context, const
 			// address outside the target image (a missing weak import is 0) is an interposer's, which resolve applied and is arm64e code, and is not wrapped
 			if ( (addend == 0) && (targetImage != NULL) && targetImage->containsAddress((void*)symbolAddress) && dyld3::darling::cpusubtypeIsArm64e(this->machHeader()->cpusubtype) )
 				symbolAddress = dyld3::darling::adaptedTarget(symbolName, symbolAddress, dyld3::darling::cpusubtypeIsArm64e(targetImage->machHeader()->cpusubtype));
+			// EXPERIMENT: and the opposite direction, a plain image with chained fixups binding an export of an arm64e image
+			else if ( (addend == 0) && (targetImage != NULL) && targetImage->containsAddress((void*)symbolAddress) )
+				symbolAddress = dyld3::darling::reverseAdaptedTarget(symbolName, symbolAddress, dyld3::darling::cpusubtypeIsArm64e(targetImage->machHeader()->cpusubtype), &darlingAddressIsCode);
 #endif
 			targetAddrs.push_back((void*)(symbolAddress + addend));
 		}

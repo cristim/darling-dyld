@@ -78,6 +78,43 @@ const char* validateAdapterRows(const AdapterRow* rows, size_t count);
 // is the raw function and is not interposed by an arm64e interposer (not tested under a guest). Safe to call from several threads (the thunk cache has its own lock).
 uint64_t adaptedTarget(const char* symbol, uint64_t target, bool targetIsArm64e);
 
+// ------------------------------------------------------------------------------------------ the opposite direction
+//
+// EXPERIMENT (local branch exp/l4-reverse-adapters, never pushed). A PLAIN importer (Darling's libobjc, any plain image)
+// binding an export of an ARM64E image (the shared cache's libc++ and libc++abi). The arm64e callee stores or calls a
+// function pointer argument through an authenticated call and expects a signature (key IA, discriminator 0, what the
+// compiler gives a C function pointer); plain code never signs. And plain code cannot call a handler that the arm64e callee
+// hands back signed. A thunk signs each masked argument on the way in and strips the result on the way out.
+//
+// Residual trust: plain code is the trusted source of what it passes, so a pointer it hands over is signed without proof
+// of origin; that is the point of this direction. It is not a signing oracle for attacker-chosen values because (1) only a
+// plain importer's own binds reach the thunk (an arm64e importer binds the arm64e export directly, and cannot reach the
+// thunk by dlsym either), (2) the thunk signs an argument only when it lies in an executable segment of an image that is
+// loaded right now, so heap, stack and data values and values that already carry a signature pass through unchanged (and
+// then fail where they are authenticated), (3) 0 is never signed. What it does not prove: that the address is the start of
+// a function. A plain image that an attacker can drive to call set_terminate(x) with any x in a code segment can pick x,
+// which is also what it could do by calling x itself.
+struct ReverseRow {
+	const char*		symbol;			// Mach-O name, with the leading underscore
+	uint8_t			signMask;		// bit i: argument i is a code pointer to sign (IA, discriminator 0)
+	bool			stripReturn;	// the result is a code pointer that plain code calls: strip its signature
+	uint8_t			argCount;		// register arguments up to the last one the row touches, at most 8; 0 for a getter
+	AdapterStatus	status;			// Probed, ShapeOnly or Unsupported
+	const char*		evidence;		// never empty
+};
+
+typedef bool (*CodeAddressPredicate)(uint64_t address);
+
+const ReverseRow* reverseRows(size_t* count);
+const ReverseRow* findReverseRow(const char* symbol);
+const char* validateReverseRows(const ReverseRow* rows, size_t count);
+
+// What a plain importer should bind for `symbol` when the resolved target is at `target` in an arm64e image: a thunk when
+// there is a supported row, otherwise `target` (an Unsupported row warns). isCode says whether an address lies in an
+// executable segment of a loaded image; it is kept for the thunks' calls. The caller has checked that the importer is plain
+// and that `target` lies in its exporter, not in an interposer.
+uint64_t reverseAdaptedTarget(const char* symbol, uint64_t target, bool targetIsArm64e, CodeAddressPredicate isCode);
+
 // DYLD_DARLING_ARM64E_ADAPTERS: off binds the raw targets, as before the adapters existed. report also warns, once per
 // symbol, for every plain function an arm64e image binds that has no row at all (the way to find a callback-taking import
 // that the table does not know; a symbol with a row never warns here).
@@ -91,6 +128,7 @@ bool sealExecutablePage(void* page, size_t length);
 // The thunk bytes, exposed so a test can compare them with an assembler. Both return the number of words written.
 size_t emitAuthThunk(uint32_t* words, uint8_t authMask, uint64_t real);
 size_t emitCallThunk(uint32_t* words, const AdapterRow* row, uint64_t real);
+size_t emitReverseThunk(uint32_t* words, const ReverseRow* row, uint64_t real);
 uint64_t callThunkHelperAddress();
 
 } // namespace darling

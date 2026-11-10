@@ -23,6 +23,10 @@ static const AdapterRow kRows[] = {
 #include "DarlingArm64eAdapterRows.inc"
 };
 
+static const ReverseRow kReverseRows[] = {
+#include "DarlingArm64eReverseRows.inc"
+};
+
 // A Block_literal_1. flags: 1<<24 BLOCK_NEEDS_FREE (heap), 1<<28 BLOCK_IS_GLOBAL.
 struct BlockLiteral {
 	void*		isa;
@@ -157,8 +161,8 @@ uint64_t callThunkHelperAddress()
 	return (uint64_t)&callRow;
 }
 
-// Saves x0-x7 below a frame record, then callRow(regs, row, real) does the work and returns the result in x0.
-size_t emitCallThunk(uint32_t* words, const AdapterRow* row, uint64_t real)
+// Saves x0-x7 below a frame record, then helper(regs, row, real) does the work and returns the result in x0.
+static size_t emitCallThunkWith(uint32_t* words, const void* row, uint64_t real, uint64_t helper)
 {
 	static const uint32_t kTemplate[14] = {
 		0xA9BB7BFD,		// stp x29, x30, [sp, #-80]!
@@ -179,8 +183,21 @@ size_t emitCallThunk(uint32_t* words, const AdapterRow* row, uint64_t real)
 	memcpy(words, kTemplate, sizeof(kTemplate));
 	putLiteral(&words[14], (uint64_t)row);
 	putLiteral(&words[16], real);
-	putLiteral(&words[18], callThunkHelperAddress());
+	putLiteral(&words[18], helper);
 	return 20;
+}
+
+size_t emitCallThunk(uint32_t* words, const AdapterRow* row, uint64_t real)
+{
+	return emitCallThunkWith(words, row, real, callThunkHelperAddress());
+}
+
+static uint64_t callReverseRow(uint64_t* regs, const ReverseRow* row, uint64_t real);
+
+// Exposed for the host test, like emitCallThunk
+size_t emitReverseThunk(uint32_t* words, const ReverseRow* row, uint64_t real)
+{
+	return emitCallThunkWith(words, row, real, (uint64_t)&callReverseRow);
 }
 
 // Thunks are never in a page that is writable and executable at once. Each new thunk gets its own page: mapped read-write,
@@ -190,7 +207,7 @@ size_t emitCallThunk(uint32_t* words, const AdapterRow* row, uint64_t real)
 // holds the lock; it only ever grows, and a hit reads an entry that is complete and a sealed page.
 static const size_t kThunkPageSize = 16384;		// the largest page size of the hosts (Asahi has 16 KiB)
 
-struct ThunkEntry { const AdapterRow* row; uint64_t real; uint64_t thunk; };
+struct ThunkEntry { const void* row; uint64_t real; uint64_t thunk; };
 static ThunkEntry sThunks[128];
 static size_t sThunkCount;
 // Thunks are made by a bind or by dlsym, neither of which is async-signal-safe, so no signal handler can arrive on a thread
@@ -219,8 +236,8 @@ bool sealExecutablePage(void* page, size_t length)
 	return mprotect(page, length, PROT_READ | PROT_EXEC) == 0;
 }
 
-// 0 when no page can be had
-static uint64_t emitThunkLocked(const AdapterRow* row, uint64_t real)
+// 0 when no page can be had. A row of the table of the opposite direction is told apart by `reverse`.
+static uint64_t emitThunkLocked(const void* row, bool reverse, uint64_t real)
 {
 	for (size_t i = 0; i != sThunkCount; ++i) {
 		if ( (sThunks[i].row == row) && (sThunks[i].real == real) )
@@ -229,8 +246,15 @@ static uint64_t emitThunkLocked(const AdapterRow* row, uint64_t real)
 	if ( sThunkCount == sizeof(sThunks) / sizeof(sThunks[0]) )
 		return 0;
 	uint32_t words[40];
-	const bool simple = (row->blockArg == 0) && (row->structArg == 0) && (row->ret == ReturnFix::None);
-	const size_t count = simple ? emitAuthThunk(words, row->authMask, real) : emitCallThunk(words, row, real);
+	size_t count;
+	if ( reverse ) {
+		count = emitReverseThunk(words, (const ReverseRow*)row, real);
+	}
+	else {
+		const AdapterRow* adapterRow = (const AdapterRow*)row;
+		const bool simple = (adapterRow->blockArg == 0) && (adapterRow->structArg == 0) && (adapterRow->ret == ReturnFix::None);
+		count = simple ? emitAuthThunk(words, adapterRow->authMask, real) : emitCallThunk(words, adapterRow, real);
+	}
 	void* page = mmap(nullptr, kThunkPageSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
 	if ( page == MAP_FAILED )
 		return 0;
@@ -243,10 +267,10 @@ static uint64_t emitThunkLocked(const AdapterRow* row, uint64_t real)
 	return (uint64_t)page;
 }
 
-static uint64_t emitThunk(const AdapterRow* row, uint64_t real)
+static uint64_t emitThunk(const void* row, bool reverse, uint64_t real)
 {
 	while ( __sync_lock_test_and_set(&sThunkLock, 1) ) { }
-	const uint64_t thunk = emitThunkLocked(row, real);
+	const uint64_t thunk = emitThunkLocked(row, reverse, real);
 	__sync_lock_release(&sThunkLock);
 	return thunk;
 }
@@ -550,6 +574,95 @@ static uint64_t callRow(uint64_t* regs, const AdapterRow* row, uint64_t real)
 	return result;
 }
 
+// ------------------------------------------------------------------------------------------ the opposite direction
+
+static CodeAddressPredicate sIsCode;
+
+const ReverseRow* reverseRows(size_t* count)
+{
+	*count = sizeof(kReverseRows) / sizeof(kReverseRows[0]);
+	return kReverseRows;
+}
+
+const ReverseRow* findReverseRow(const char* symbol)
+{
+	for (const ReverseRow& row : kReverseRows) {
+		if ( strcmp(row.symbol, symbol) == 0 )
+			return &row;
+	}
+	return nullptr;
+}
+
+const char* validateReverseRows(const ReverseRow* rows, size_t count)
+{
+	for (size_t i = 0; i != count; ++i) {
+		const ReverseRow& r = rows[i];
+		if ( (r.symbol == nullptr) || (r.symbol[0] != '_') )
+			return "a symbol is missing the Mach-O underscore";
+		for (size_t j = 0; j != i; ++j) {
+			if ( strcmp(rows[j].symbol, r.symbol) == 0 )
+				return "a symbol has two rows";
+		}
+		if ( (r.evidence == nullptr) || (r.evidence[0] == '\0') )
+			return "a row has no evidence";
+		const bool acts = (r.signMask != 0) || r.stripReturn;
+		if ( r.status == AdapterStatus::Unsupported ) {
+			if ( acts )
+				return "a row without an adapter has an action";
+			continue;
+		}
+		if ( (r.status == AdapterStatus::HandledElsewhere) )
+			return "the opposite direction has no HandledElsewhere rows";
+		if ( !acts )
+			return "a row does nothing";
+		if ( r.argCount > 8 )
+			return "a row takes more than eight register arguments";
+		if ( (r.argCount < 8) && ((r.signMask >> r.argCount) != 0) )
+			return "a sign mask names an argument the row does not have";
+	}
+	return nullptr;
+}
+
+// Plain code is the source of every masked argument. An argument is signed only when it lies in an executable segment of
+// an image that is loaded now; 0, data addresses and values that already carry a signature (which no segment holds) go
+// through unchanged, and an arm64e callee that authenticates them then fails. Without a predicate nothing is signed.
+static uint64_t callReverseRow(uint64_t* regs, const ReverseRow* row, uint64_t real)
+{
+	uint64_t a[8];
+	memcpy(a, regs, sizeof(a));
+	for (unsigned i = 0; i != 8; ++i) {
+		if ( ((row->signMask >> i) & 1) == 0 )
+			continue;
+		if ( (a[i] != 0) && (sIsCode != nullptr) && sIsCode(a[i]) )
+			a[i] = AdapterSign::signPointer(a[i], nullptr, false, 0, 0);
+	}
+	uint64_t result = ((Call8)real)(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
+	if ( row->stripReturn )
+		result = stripCode(result);
+	return result;
+}
+
+uint64_t reverseAdaptedTarget(const char* symbol, uint64_t target, bool targetIsArm64e, CodeAddressPredicate isCode)
+{
+	if ( (sMode == AdapterMode::Off) || !targetIsArm64e )
+		return target;
+	const ReverseRow* row = findReverseRow(symbol);
+	if ( row == nullptr )
+		return target;
+	if ( row->status == AdapterStatus::Unsupported ) {
+		dyld::warn("arm64e adapters: %s is bound by a plain image to an arm64e image and has no adapter (%s); a code pointer it passes or receives is not converted\n",
+				   symbol, row->evidence);
+		return target;
+	}
+	__atomic_store_n(&sIsCode, isCode, __ATOMIC_RELAXED);
+	const uint64_t thunk = emitThunk(row, true, target);
+	if ( thunk == 0 ) {
+		dyld::warn("arm64e adapters: no room for a thunk for %s; it is bound unadapted\n", symbol);
+		return target;
+	}
+	return thunk;
+}
+
 // ------------------------------------------------------------------------------------------ bind time
 
 // report mode: a symbol is named once, by a 64-bit FNV-1a hash (a name pointer may not outlive its image; a collision only
@@ -589,7 +702,7 @@ uint64_t adaptedTarget(const char* symbol, uint64_t target, bool targetIsArm64e)
 				   symbol, row->evidence);
 		return target;
 	}
-	const uint64_t thunk = emitThunk(row, target);
+	const uint64_t thunk = emitThunk(row, false, target);
 	if ( thunk == 0 ) {
 		dyld::warn("arm64e adapters: no room for a thunk for %s; it is bound unadapted and calls with a signed pointer fault\n", symbol);
 		return target;
@@ -605,6 +718,12 @@ const AdapterRow* adapterRows(size_t* count) { *count = 0; return kRows; }
 const AdapterRow* findAdapterRow(const char*) { return nullptr; }
 const char* validateAdapterRows(const AdapterRow*, size_t) { return nullptr; }
 uint64_t adaptedTarget(const char*, uint64_t target, bool) { return target; }
+static const ReverseRow kReverseRows[] = { { "_unused", 0, false, 0, AdapterStatus::Unsupported, "not arm64" } };
+const ReverseRow* reverseRows(size_t* count) { *count = 0; return kReverseRows; }
+const ReverseRow* findReverseRow(const char*) { return nullptr; }
+const char* validateReverseRows(const ReverseRow*, size_t) { return nullptr; }
+uint64_t reverseAdaptedTarget(const char*, uint64_t target, bool, CodeAddressPredicate) { return target; }
+size_t emitReverseThunk(uint32_t*, const ReverseRow*, uint64_t) { return 0; }
 size_t emitAuthThunk(uint32_t*, uint8_t, uint64_t) { return 0; }
 size_t emitCallThunk(uint32_t*, const AdapterRow*, uint64_t) { return 0; }
 uint64_t callThunkHelperAddress() { return 0; }
