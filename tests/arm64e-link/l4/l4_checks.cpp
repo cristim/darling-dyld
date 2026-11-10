@@ -532,6 +532,105 @@ int y1_handler_slots() { return fail("not arm64e"); }
 int y2_set_signed_terminate_then_init() { return fail("not arm64e"); }
 #endif
 
+
+// EXPERIMENT (reverse adapters, local): plain code (l4_plain.dylib, loaded by dlopen from L4_PLAIN_DYLIB) calls the cache's
+// std::set_terminate / std::get_terminate through the reverse thunks
+#if __has_feature(ptrauth_intrinsics)
+typedef void (*z_handler_t)(void);
+struct z_plain { z_handler_t (*set)(z_handler_t); z_handler_t (*get)(void); void (*entry)(void); int *data; unsigned long *slot; };
+static unsigned long z_sign(unsigned long p) { return (unsigned long)__builtin_ptrauth_sign_unauthenticated((void *)p, 0, 0); }
+static unsigned long z_strip(unsigned long p) { return (unsigned long)__builtin_ptrauth_strip((void *)p, 0); }
+void z_arm64e_handler() { std::abort(); }
+static int z_load(z_plain *p) {
+    const char *path = getenv("L4_PLAIN_DYLIB");
+    if (!path) return fail("L4_PLAIN_DYLIB is not set");
+    void *h = dlopen(path, RTLD_NOW);
+    if (!h) return fail("dlopen of the plain dylib failed");
+    p->set = (z_handler_t (*)(z_handler_t))dlsym(h, "plain_set_terminate");   // dlsym signs it for this arm64e caller
+    p->get = (z_handler_t (*)(void))dlsym(h, "plain_get_terminate");
+    p->entry = (void (*)(void))dlsym(h, "plain_entry");
+    p->data = (int *)dlsym(h, "plain_data");
+    p->slot = (unsigned long *)dlsym(RTLD_DEFAULT, "__cxa_terminate_handler");
+    if (!p->set || !p->get || !p->entry || !p->data || !p->slot) return fail("a symbol of the plain dylib or the handler slot is missing");
+    return 0;
+}
+int z1_plain_entry_is_signed() {
+    z_plain p; if (z_load(&p)) return 1;
+    unsigned long entry = z_strip((unsigned long)p.entry);
+    z_handler_t old = p.set((z_handler_t)entry);
+    REQUIRE((unsigned long)old == z_strip((unsigned long)old));   // the old handler came back raw
+    REQUIRE(*p.slot == z_sign(entry));                            // and the callee got the IA/0 signature of the entry
+    REQUIRE(*p.slot != entry);
+    PASS();
+}
+int z2_mid_function_address_not_signed() {
+    z_plain p; if (z_load(&p)) return 1;
+    unsigned long mid = z_strip((unsigned long)p.entry) + 4;
+    p.set((z_handler_t)mid);
+    REQUIRE(*p.slot == mid);   // stored as it was: no signature for a non-entry
+    PASS();
+}
+int z3_arm64e_image_address_not_signed() {
+    z_plain p; if (z_load(&p)) return 1;
+    unsigned long a = z_strip((unsigned long)z_arm64e_handler);
+    p.set((z_handler_t)a);
+    REQUIRE(*p.slot == a);
+    PASS();
+}
+int z4_data_address_not_signed() {
+    z_plain p; if (z_load(&p)) return 1;
+    unsigned long a = (unsigned long)p.data;
+    p.set((z_handler_t)a);
+    REQUIRE(*p.slot == a);
+    PASS();
+}
+int z5_round_trip() {
+    z_plain p; if (z_load(&p)) return 1;
+    std::set_terminate(z_arm64e_handler);                       // arm64e code installs a handler (signed by the compiler)
+    unsigned long h = (unsigned long)p.get();                   // plain code receives it
+    REQUIRE(h == z_strip((unsigned long)z_arm64e_handler));     // raw, authenticated
+    p.set((z_handler_t)z_strip((unsigned long)p.entry));        // something else in the slot
+    REQUIRE(*p.slot != 0 && *p.slot != z_strip(*p.slot));
+    p.set((z_handler_t)h);                                      // plain code restores it: an arm64e address it was handed
+    REQUIRE(*p.slot == z_sign(h));
+    // control: an arm64e address that plain code was never handed is not signed
+    unsigned long other = z_strip((unsigned long)dlsym(RTLD_DEFAULT, "_ZSt9terminatev"));
+    REQUIRE(other != 0);
+    p.set((z_handler_t)other);
+    REQUIRE(*p.slot == other);
+    PASS();
+}
+int z6_corrupted_return_stops() {
+    z_plain p; if (z_load(&p)) return 1;
+    *p.slot = 0x0000000100001234UL;      // a handler that does not authenticate
+    p.get();                              // must stop the process, not hand plain code a stripped pointer
+    return fail("plain code was handed a handler that failed authentication");
+}
+int z7_null_maps_to_default() {
+    z_plain p; if (z_load(&p)) return 1;
+    p.set((z_handler_t)(void *)0);   // the standard maps a null handler to the default one, which the cache signed
+    REQUIRE(*p.slot != 0 && *p.slot != z_strip(*p.slot));
+    unsigned long got = (unsigned long)p.get();
+    REQUIRE(got != 0 && got == z_strip(*p.slot));
+    PASS();
+}
+int z8_throw_after_plain_set() {
+    z_plain p; if (z_load(&p)) return 1;
+    p.set((z_handler_t)z_strip((unsigned long)p.entry));   // plain code installs its own handler through the thunk
+    try { throw 5; } catch (int v) { REQUIRE(v == 5); }
+    PASS();
+}
+#else
+int z1_plain_entry_is_signed() { return fail("not arm64e"); }
+int z2_mid_function_address_not_signed() { return fail("not arm64e"); }
+int z3_arm64e_image_address_not_signed() { return fail("not arm64e"); }
+int z4_data_address_not_signed() { return fail("not arm64e"); }
+int z5_round_trip() { return fail("not arm64e"); }
+int z6_corrupted_return_stops() { return fail("not arm64e"); }
+int z7_null_maps_to_default() { return fail("not arm64e"); }
+int z8_throw_after_plain_set() { return fail("not arm64e"); }
+#endif
+
 #define EXP_STD "c1=ok,c2=any,c3=ok,native=ok"
 // not from the cache is a recorded fact (failed), never a fault
 #define EXP_CACHE "c1=failed,c2=failed,c3=ok,native=failed"
@@ -579,6 +678,14 @@ const struct check checks[] = {
     {"x8_get_unexpected_via_dlsym", x8_get_unexpected_via_dlsym, "c1=any,c2=any,c3=any,native=any"},
     {"y1_handler_slots", y1_handler_slots, "c1=any,c2=any,c3=any,native=any"},
     {"y2_set_signed_terminate_then_init", y2_set_signed_terminate_then_init, "c1=any,c2=any,c3=any,native=any"},
+    {"z1_plain_entry_is_signed", z1_plain_entry_is_signed, "c1=any,c2=any,c3=ok,native=any"},
+    {"z2_mid_function_address_not_signed", z2_mid_function_address_not_signed, "c1=any,c2=any,c3=ok,native=any"},
+    {"z3_arm64e_image_address_not_signed", z3_arm64e_image_address_not_signed, "c1=any,c2=any,c3=ok,native=any"},
+    {"z4_data_address_not_signed", z4_data_address_not_signed, "c1=any,c2=any,c3=ok,native=any"},
+    {"z5_round_trip", z5_round_trip, "c1=any,c2=any,c3=ok,native=any"},
+    {"z6_corrupted_return_stops", z6_corrupted_return_stops, "c1=any,c2=any,c3=faulted,native=any"},
+    {"z7_null_maps_to_default", z7_null_maps_to_default, "c1=any,c2=any,c3=ok,native=any"},
+    {"z8_throw_after_plain_set", z8_throw_after_plain_set, "c1=any,c2=any,c3=ok,native=any"},
     {"x4_init_primary_exception", x4_init_primary_exception, "c1=any,c2=any,c3=any,native=any"},
 };
 const int nchecks = sizeof checks / sizeof checks[0];
