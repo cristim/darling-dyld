@@ -1918,6 +1918,35 @@ bool _dyld_shared_cache_optimized()
     return false;
 }
 
+// l6 scratch DETECTION ONLY: the Swift dyld SPIs, each logging its call and answering "nothing" (dyld-1378 DyldAPIs.cpp
+// :2724-2733 not found without objc/swift cache info, :2861-2882 false without a prebuilt set, :4162 null).
+#include <unistd.h>
+static void l6SpiLog(const char* name)
+{
+    char buf[96];
+    size_t n = strlcpy(buf, "L6SPI ", sizeof(buf));
+    n = strlcat(buf, name, sizeof(buf));
+    n = strlcat(buf, "\n", sizeof(buf));
+    write(2, buf, n);
+}
+struct l6_conformance_result { uintptr_t kind; const void* value; };
+extern "C" {
+struct l6_conformance_result _dyld_find_protocol_conformance(const void*, const void*, const void*)
+{ l6SpiLog("_dyld_find_protocol_conformance"); return { 2, NULL }; }
+struct l6_conformance_result _dyld_find_foreign_type_protocol_conformance(const void*, const char*, size_t)
+{ l6SpiLog("_dyld_find_foreign_type_protocol_conformance"); return { 2, NULL }; }
+uint32_t _dyld_swift_optimizations_version(void)
+{ l6SpiLog("_dyld_swift_optimizations_version"); return 1; }
+bool _dyld_has_preoptimized_swift_protocol_conformances(const struct mach_header*)
+{ l6SpiLog("_dyld_has_preoptimized_swift_protocol_conformances"); return false; }
+struct l6_conformance_result _dyld_find_protocol_conformance_on_disk(const void*, const void*, const void*, uint32_t)
+{ l6SpiLog("_dyld_find_protocol_conformance_on_disk"); return { 2, NULL }; }
+struct l6_conformance_result _dyld_find_foreign_type_protocol_conformance_on_disk(const void*, const char*, size_t, uint32_t)
+{ l6SpiLog("_dyld_find_foreign_type_protocol_conformance_on_disk"); return { 2, NULL }; }
+const void* _dyld_find_pointer_hash_table_entry(const void*, const void*, size_t, const void**)
+{ l6SpiLog("_dyld_find_pointer_hash_table_entry"); return NULL; }
+}
+
 // l6 scratch: dyld-1378 DyldAPIs.cpp:4116-4128 answers null when prespecialization is disabled or the cache has none
 const void* _dyld_get_swift_prespecialized_data(void)
 {
