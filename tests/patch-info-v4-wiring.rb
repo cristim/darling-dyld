@@ -75,10 +75,11 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
         inline uint64_t adaptedTarget(const char *symbol, uint64_t target, bool targetIsArm64e) { return targetIsArm64e ? target : target | kThunkBit; }
       }
     }
-    struct mach_header { int cpusubtype; };
+    struct mach_header { int cpusubtype; uint32_t cacheIndex = 0; };   // cacheIndex: where the cache lists the image, for the images that are in it
     // The cache: which images it has, whether it has version 4 patch info, and what overridePatchGotSlots does.
     struct DyldSharedCache {
-      struct PatchOverrideStats { uint64_t exports, slots, patched, unexplained, missingExports, missingSlots, plainSlots, plainPatched, plainUnexplained, plainMissing; bool alreadyApplied; };
+      struct PatchOverrideStats { uint64_t exports, slots, patched, unexplained, missingExports, missingSlots, plainSlots, plainPatched, plainUnexplained, plainMissing, plainClientsRunning; bool alreadyApplied; };
+      enum { kPlainClientIgnore = 0, kPlainClientPatch = 1, kPlainClientRunning = 2 };
       typedef void (*DataConstLogFunc)(const char*, ...);
       bool patchInfo = true;
       std::vector<std::string> images = {"/usr/lib/libSystem.B.dylib", "/usr/lib/system/libsystem_kernel.dylib", "/usr/lib/system/libsystem_c.dylib", "/usr/lib/libz.1.dylib", "/usr/lib/system/libsystem_malloc.dylib", "/usr/lib/system/libsystem_platform.dylib"};
@@ -86,25 +87,33 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
       const char *error = nullptr;                 // what overridePatchGotSlots returns for index 2
       bool hasPatchInfoV4() const { return patchInfo; }
       const char *getIndexedImagePath(uint32_t i) const { return images[i].c_str(); }
-      // symbols the exporter has in its GOT: two the loaded image defines and one it does not; index 4 has two unexplained slots instead
-      const char *overridePatchGotSlots(uint32_t index, bool (^resolve)(const char *symbol, bool classExport, uint64_t *address), DataConstLogFunc logFunc, PatchOverrideStats *s) const {
-        calls.push_back(index); logOn.push_back(logFunc != nullptr);
+      bool findMachHeaderImageIndex(const mach_header *mh, uint32_t &index) const { index = mh->cacheIndex; return true; }
+      // Every image of the cache is a client of every exporter, with one plain location per symbol. Symbols the exporter has in its GOT: two the loaded
+      // image defines and one it does not; index 4 has two unexplained slots, and index 5 only a refused plain location, per client to patch.
+      const char *overridePatchGotSlots(uint32_t index, bool (^resolve)(const char *symbol, bool classExport, uint64_t *address), int (^clientAction)(uint32_t), DataConstLogFunc logFunc, PatchOverrideStats *s) const {
+        calls.push_back(index); logOn.push_back(logFunc != nullptr); actionNull.push_back(clientAction == nullptr);
         memset(s, 0, sizeof *s);
-        if (applied.count(index)) { s->alreadyApplied = true; return nullptr; }
-        if (index == 2 && error) return error;
-        applied.insert(index);
-        if (index == 5) { s->exports = 1; s->slots = 1; s->patched = 1; s->plainSlots = 2; s->plainPatched = 1; s->plainUnexplained = 1; return nullptr; }   // only a plain location is refused
-        if (index == 4) { s->exports = 1; s->slots = 2; s->unexplained = 2; s->plainSlots = 1; s->plainUnexplained = 1; return nullptr; }
+        const bool wasApplied = applied.count(index) != 0;
+        if (wasApplied) { s->alreadyApplied = true; if (!clientAction) return nullptr; }
+        else { if (index == 2 && error) return error; applied.insert(index); }
+        uint64_t patchClients = 0;
+        if (clientAction) for (uint32_t c = 0; c < images.size(); ++c) { const int a = clientAction(c); patchClients += a == kPlainClientPatch; if (a == kPlainClientRunning && !wasApplied) ++s->plainClientsRunning; }
+        patchedClients.push_back(patchClients);
+        if (index == 5) { if (!wasApplied) { s->exports = 1; s->slots = 1; s->patched = 1; } s->plainSlots = 2 * patchClients; s->plainPatched = patchClients; s->plainUnexplained = patchClients; return nullptr; }
+        if (index == 4) { if (!wasApplied) { s->exports = 1; s->slots = 2; s->unexplained = 2; } s->plainSlots = patchClients; s->plainUnexplained = patchClients; return nullptr; }
         std::vector<std::string> names = {"_open", "_close", "_nosuchsymbol"}; names.insert(names.end(), moreNames.begin(), moreNames.end());
         for (const std::string &nameString : names) {
           const char *name = nameString.c_str();
-          uint64_t address = 0; ++s->exports; s->slots += 2;
-          ++s->plainSlots;     // one plain location per symbol, with the verdict of the GOT slots (the real reader looks each export up once)
-          if (resolve(name, classNames.count(name) != 0, &address)) { s->patched += 2; ++s->plainPatched; lastAddress[name] = address; } else { ++s->missingExports; s->missingSlots += 2; ++s->plainMissing; }
+          uint64_t address = 0;
+          if (wasApplied && patchClients == 0) break;
+          const bool found = resolve(name, classNames.count(name) != 0, &address);
+          if (found) lastAddress[name] = address;
+          if (!wasApplied) { ++s->exports; s->slots += 2; if (found) s->patched += 2; else { ++s->missingExports; s->missingSlots += 2; } }
+          s->plainSlots += patchClients; (found ? s->plainPatched : s->plainMissing) += patchClients;
         }
         return nullptr;
       }
-      std::vector<std::string> moreNames; mutable std::map<std::string, uint64_t> lastAddress; mutable std::vector<bool> logOn; std::set<std::string> classNames;   // the symbols the cache has as kind 8 exports
+      std::vector<std::string> moreNames; mutable std::map<std::string, uint64_t> lastAddress; mutable std::vector<bool> logOn, actionNull; mutable std::vector<uint64_t> patchedClients; std::set<std::string> classNames;   // the symbols the cache has as kind 8 exports
     };
     struct ImageLoader {
       struct LinkContext { bool verboseMapping = false; bool linkingMainExecutable = false; };
@@ -149,11 +158,12 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
 
     static ImageLoader *image(const char *install, bool inCache = false) {
       ImageLoader *i = new ImageLoader; i->install = install; i->path = std::string("/prefix") + install; i->inCache = inCache;
+      for (uint32_t n = 0; n != DyldSharedCache().images.size(); ++n) if (DyldSharedCache().images[n] == install) i->header.cacheIndex = n;
       i->exports = {{"_open", 0x1000}, {"_close", 0x2000}}; return i;   // _nosuchsymbol is not exported
     }
     // a disk image standing in for cache image `index`, as loadPhase5 records it
     static void shadow(const char *install, uint32_t index) { ImageLoader *i = image(install); sAllImages.push_back(i); sDiskOverridesOfCacheImages.push_back({i, index}); }
-    static void reset(DyldSharedCache &cache) { sAllImages.clear(); sDiskOverridesOfCacheImages.clear(); cache.calls.clear(); cache.applied.clear(); cache.lastAddress.clear(); cache.logOn.clear(); cache.classNames.clear(); cache.moreNames.clear(); cache.error = nullptr; cache.patchInfo = true; logged.clear(); }
+    static void reset(DyldSharedCache &cache) { sAllImages.clear(); sDiskOverridesOfCacheImages.clear(); cache.calls.clear(); cache.applied.clear(); cache.lastAddress.clear(); cache.logOn.clear(); cache.actionNull.clear(); cache.patchedClients.clear(); sCacheImagesSeen.clear(); sCacheExportersDone.clear(); cache.classNames.clear(); cache.moreNames.clear(); cache.error = nullptr; cache.patchInfo = true; logged.clear(); }
     static unsigned summaries() { unsigned n = 0; for (const std::string &l : logged) n += l.find("split cache GOT override: patched=") != std::string::npos; return n; }
 
     int main() {
@@ -191,15 +201,34 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
       // --- an anomaly (slots refused for their encoding or kind) is always reported, once, with the cumulative totals ---
       shadow("/usr/lib/system/libsystem_malloc.dylib", 4);
       overrideSplitCacheGotSlots();
-      CHECK(summaries() == 1 && logged.size() == 1 && logged[0].find("patched=8 missing=4 unexplained=2 plain-patched=4 plain-missing=2 plain-unexplained=1") != std::string::npos);
+      // libz was seen by the first pass: a stand-in that appears later leaves its plain locations alone (libSystem and malloc patch none)
+      CHECK(summaries() == 1 && logged.size() == 1 && logged[0].find("patched=8 missing=4 unexplained=2 plain-patched=2 plain-missing=1 plain-unexplained=0") != std::string::npos);
       logged.clear();
       overrideSplitCacheGotSlots();
       CHECK(logged.empty());                                              // nothing new, nothing to say
-      // a plain location refused for its encoding is an anomaly too, even when no GOT slot is
+      CHECK(cache.actionNull.back());                                     // an exporter that is done and no new client: not even the plain check is asked for
+      // a dlopen loads a cache image (libsystem_c, index 2) and a stand-in for libsystem_platform (index 5): the new image is patched for every
+      // exporter, the old ones included, before it runs; a plain location refused for its encoding is an anomaly too, even when no GOT slot is
+      cache.calls.clear(); cache.patchedClients.clear(); cache.actionNull.clear();
+      sAllImages.push_back(image("/usr/lib/system/libsystem_c.dylib", true));
       shadow("/usr/lib/system/libsystem_platform.dylib", 5);
       overrideSplitCacheGotSlots();
-      CHECK(summaries() == 1 && logged.size() == 1 && logged[0].find("patched=9 missing=4 unexplained=2 plain-patched=5 plain-missing=2 plain-unexplained=2") != std::string::npos);
+      CHECK((cache.calls == std::vector<uint32_t>{1, 0, 4, 5}) && (cache.patchedClients == std::vector<uint64_t>{1, 1, 1, 1}));   // exactly one client to patch each: libsystem_c
+      CHECK(summaries() == 1 && logged.size() == 1 && logged[0].find("patched=9 missing=4 unexplained=2 plain-patched=7 plain-missing=3 plain-unexplained=2") != std::string::npos);
       logged.clear();
+      // the images seen are not patched again, however many passes
+      cache.calls.clear(); cache.actionNull.clear();
+      overrideSplitCacheGotSlots();
+      CHECK((cache.actionNull == std::vector<bool>{true, true, true, true}) && logged.empty());
+      // under the cache policy option a stand-in that comes after the images ran says how many keep the cache's pointers
+      gLogCachePolicy = true; logged.clear();
+      shadow("/usr/lib/system/libsystem_kernel.dylib", 1);
+      sDiskOverridesOfCacheImages.pop_back(); sDiskOverridesOfCacheImages.erase(sDiskOverridesOfCacheImages.begin());   // keep only a new exporter: libSystem.B
+      cache.applied.erase(0);
+      sCacheExportersDone[0] = false;
+      overrideSplitCacheGotSlots();
+      { unsigned running = 0; for (const std::string &l : logged) running += l.find("2 cache image(s) in the process have run already") != std::string::npos; CHECK(running == 1); }
+      gLogCachePolicy = false;
 
       // --- the verbose mapping option: one line per patched symbol and the summary; none without it ---
       reset(cache);
