@@ -1375,8 +1375,20 @@ static void notifyBatchPartial(dyld_image_states state, bool orLater, dyld_image
 	}
 }
 
+#ifdef DARLING
+static void overrideSplitCacheGotSlots();
+#endif
+
 static void notifyBatch(dyld_image_states state, bool preflightOnly)
 {
+#ifdef DARLING
+	// ImageLoader::link() sends this once the images of a dlopen are bound. The add-image callbacks and objc's mapped callback run in it
+	// and read and write the cache images' data (libdyld's tlv_initialize_descriptors sets the thread-local thunks that the override
+	// would otherwise set back), so the override has to be done by then. At launch it is a no-op here (the main executable is still
+	// linking) and _main does it after the binds, before any callback is registered.
+	if ( (state == dyld_image_state_bound) && !preflightOnly )
+		overrideSplitCacheGotSlots();
+#endif
 	notifyBatchPartial(state, false, NULL, preflightOnly, false);
 }
 
@@ -1779,8 +1791,8 @@ static void runAllStaticTerminators(void* extra)
 // What the GOT override has done so far in this process.
 static struct { uint64_t patched, missing, unexplained, plainPatched, plainMissing, plainUnexplained; } sSplitCachePatchTotals;
 // By cache image index: the images an earlier pass has seen in the process (they may have run, so their plain locations are never
-// patched later), and the exporters whose GOT is done.
-static std::vector<bool> sCacheImagesSeen, sCacheExportersDone;
+// patched later).
+static std::vector<bool> sCacheImagesSeen;
 
 // An export can sit in another library of the libSystem family on Darling than in the cache: Apple's libsystem_malloc
 // exports reallocf, Darling's is in libsystem_c. The stand-in's clients reach both through the umbrella that re-exports
@@ -1814,7 +1826,7 @@ static bool findInReExportSiblings(const ImageLoader* standIn, const char* symbo
 // The images of a split cache import through its coalesced GOT, whose slots the mapper has signed to the cache's own
 // exporters. For every cache exporter that this process provides from disk (the records loadPhase5 keeps of a disk
 // image standing in for a cache image), point the slots of the symbols it exports at the loaded image's definitions.
-// Runs at the end of link(), which holds dyld's lock (dlopen takes it explicitly, the other APIs through their glue, and
+// Runs in link() after the binds, weak binds and interposing and before the bound notification (notifyBatch), which holds dyld's lock (dlopen takes it explicitly, the other APIs through their glue, and
 // the launch is single threaded), and once more after the launch binds. The lookups run symbol resolvers (a bind stores a
 // resolver's result, and a resolver export's stub reaches the resolver through __la_resolver, which preserves less than a
 // call does), and a resolver uses its image's bound slots: the Darling native shims (ELF bridge libraries) read __got for
@@ -1864,7 +1876,7 @@ static void overrideSplitCacheGotSlots()
 			continue;
 		DyldSharedCache::PatchOverrideStats stats;
 		// an exporter that is done is entered again only for the cache images that are new
-		const bool done = (record.cacheImageIndex < sCacheExportersDone.size()) && sCacheExportersDone[record.cacheImageIndex];
+		const bool done = cache->patchOverrideDone(record.cacheImageIndex);
 		// a real cache leaves thousands of symbols to the cache (an empty libswiftCore stand-in: 3843): one line per exporter, not per symbol
 		struct { uint64_t count; const char* first[3]; } initialUndefined = { 0, { nullptr, nullptr, nullptr } };	// names point into the cache's string table, which stays mapped
 		__block decltype(initialUndefined) undefined = initialUndefined;
@@ -1895,9 +1907,6 @@ static void overrideSplitCacheGotSlots()
 		}, (done && !anyNewClient) ? (int (^)(uint32_t))nullptr : clientAction, (verbose || gLogCachePolicy) ? &dyld::log : nullptr, &stats);
 		if ( error != nullptr )
 			halt(mkstringf("split cache GOT override of '%s': %s\n", installPath, error));
-		if ( sCacheExportersDone.size() <= record.cacheImageIndex )
-			sCacheExportersDone.resize(record.cacheImageIndex + 1, false);
-		sCacheExportersDone[record.cacheImageIndex] = true;
 		sSplitCachePatchTotals.plainPatched += stats.plainPatched;
 		sSplitCachePatchTotals.plainMissing += stats.plainMissing;
 		sSplitCachePatchTotals.plainUnexplained += stats.plainUnexplained;
@@ -1943,7 +1952,7 @@ static void overrideSplitCacheGotSlots()
 #if defined(DARLING) && defined(__arm64__)
 // Cache code reads its thread pointer with `mrs Xt, TPIDRRO_EL0`, which Linux leaves at zero. Rewrite those reads for
 // every cache image before any of them runs, from the sidecar table next to the cache (see DarlingTSDIslands.h). Runs at
-// the end of link() with overrideSplitCacheGotSlots(), under the same lock and for the same reason: no cache image has run
+// the end of link(), under the same lock and for the same reason as overrideSplitCacheGotSlots(): no cache image has run
 // yet. Cheap once an image is done, and a no-op without a split cache or a cache image in the process.
 static void translateSplitCacheTSDReads()
 {
@@ -5528,9 +5537,6 @@ void link(ImageLoader* image, bool forceLazysBound, bool neverUnload, const Imag
 			path = sAllCacheImagesProxy->getIndexedPath(cacheIndex);
 #endif
 		image->link(gLinkContext, forceLazysBound, false, neverUnload, loaderRPaths, path);
-#ifdef DARLING
-		overrideSplitCacheGotSlots();
-#endif
 #if defined(DARLING) && defined(__arm64__)
 		translateSplitCacheTSDReads();
 #endif
