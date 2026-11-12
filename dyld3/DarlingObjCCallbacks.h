@@ -206,7 +206,7 @@ struct ObjCCallbackState {
 	// Large batches go out in chunks, which the interface allows (a dlopen notify is a batch of one).
 	void notifyMapped(unsigned count, const char* const* paths, const struct mach_header* const* mhs)
 	{
-		static const unsigned kMaxBatch = 64;
+		static const unsigned kMaxBatch = 1024;
 		if ( count == 0 )
 			return;
 		// The old notifiers tolerate a callback the runtime did not provide; so does this.
