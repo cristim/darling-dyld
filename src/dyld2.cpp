@@ -1801,7 +1801,7 @@ static bool findInReExportSiblings(const ImageLoader* standIn, const char* symbo
 		if ( !reExportsStandIn )
 			continue;
 		for (const ImageLoader* sibling : siblings) {
-			if ( !sibling->inSharedCache() && sibling->findExportedSymbolAddress(gLinkContext, symbol, nullptr, -1, true, foundIn, address) )
+			if ( !sibling->inSharedCache() && sibling->findExportedSymbolAddress(gLinkContext, symbol, nullptr, -1, false, foundIn, address) )
 				return true;
 		}
 	}
@@ -1837,7 +1837,11 @@ static void overrideSplitCacheGotSlots()
 		const char* error = cache->overridePatchGotSlots(record.cacheImageIndex, ^(const char* symbol, bool classExport, uint64_t* address) {
 			const ImageLoader* foundIn;
 			uintptr_t found;
-			if ( image->findExportedSymbolAddress(gLinkContext, symbol, nullptr, -1, true, &foundIn, &found) || findInReExportSiblings(image, symbol, &foundIn, &found) ) {
+			// runResolver is false: a stand-in is not necessarily bound yet, and a native shim's resolvers read __got and
+			// __elfcalls slots that its bind fills. A resolver export then yields its stub, whose lazy pointer runs the resolver
+			// on the first call (doBindFastLazySymbol, ImageLoaderMachOCompressed.cpp:1726), after the bind. The cache override
+			// of ImageLoaderMachOCompressed::doBind does the same (:1047, :1057, exportedSymbolAddress :550).
+			if ( image->findExportedSymbolAddress(gLinkContext, symbol, nullptr, -1, false, &foundIn, &found) || findInReExportSiblings(image, symbol, &foundIn, &found) ) {
 				const bool foundInIsArm64e = dyld3::darling::cpusubtypeIsArm64e(foundIn->machHeader()->cpusubtype);
 				// an arm64e runtime never realizes the classes of a plain image, so cache code would get an unsigned class pointer
 				if ( classExport && !foundInIsArm64e ) {

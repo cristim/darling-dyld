@@ -93,6 +93,7 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
     struct ImageLoader {
       struct LinkContext { bool verboseMapping = false; };
       std::string install, path; bool inCache = false; mach_header header = {1}; std::map<std::string, uintptr_t> exports; std::map<std::string, const ImageLoader*> reexportedFrom; std::vector<const ImageLoader*> reExports;
+      bool bound = true; std::map<std::string, std::pair<uintptr_t, uintptr_t>> resolvers; mutable unsigned resolverRuns = 0, resolverFaults = 0, resolverStubLookups = 0;   // exports that are stub and resolver: {stub, target}
       const char *getInstallPath() const { return install.c_str(); }
       const char *getPath() const { return path.c_str(); }
       bool inSharedCache() const { return inCache; }
@@ -100,7 +101,13 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
       void forEachReExportDependent(void (^callback)(const ImageLoader*, bool &stop)) const { bool stop = false; for (const ImageLoader *i : reExports) { callback(i, stop); if (stop) break; } }
       // the real lookup is ImageLoader::findExportedSymbolAddress (searchReExports, resolvers run for a GOT pointer)
       bool findExportedSymbolAddress(const LinkContext &, const char *name, const ImageLoader *requestor, int ordinal, bool runResolver, const ImageLoader **foundIn, uintptr_t *address) const {
-        if (requestor != nullptr || ordinal != -1 || !runResolver) return false;
+        if (requestor != nullptr || ordinal != -1) return false;
+        auto res = resolvers.find(name);
+        if (res != resolvers.end()) {   // like exportedSymbolAddress: the stub without runResolver, the resolver's answer with it; the resolver reads slots that bind fills
+          *foundIn = this; ++(runResolver ? resolverRuns : resolverStubLookups);
+          if (runResolver) { if (!bound) { ++resolverFaults; return false; } *address = res->second.second; } else *address = res->second.first;
+          return true;
+        }
         auto it = exports.find(name); if (it == exports.end()) return false;
         auto via = reexportedFrom.find(name);
         *foundIn = via == reexportedFrom.end() ? this : via->second; *address = it->second; return true;
@@ -283,6 +290,29 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
       cache.classNames = {"_close"}; classFamily(1); CHECK(cache.lastAddress.count("_close") == 0);
       classFamily(2); CHECK(cache.lastAddress["_close"] == 0x5000);
       cache.classNames.clear();
+
+      // --- a resolver export is never run by the override: the stand-in need not be bound, and a resolver of a native shim reads slots that bind fills ---
+      // _close of the stand-in is stub (0x2000) and resolver (target 0x9000); the stand-in is not bound, so running the resolver would fault
+      auto resolverCase = [&](bool inSibling, int subtype) {
+        reset(cache); sAllImages.push_back(image("/usr/lib/libz.1.dylib", true));
+        ImageLoader *standIn = image("/usr/lib/system/libsystem_kernel.dylib"); standIn->bound = false; standIn->header.cpusubtype = subtype;
+        ImageLoader *c = image("/usr/lib/system/libsystem_c.dylib"); c->exports.clear(); c->bound = false; c->header.cpusubtype = subtype;
+        ImageLoader *holder = inSibling ? c : standIn; holder->resolvers["_close"] = {0x2000, 0x9000}; holder->exports["_close"] = 0x2000;
+        if (inSibling) standIn->exports.erase("_close");
+        ImageLoader *umbrella = image("/usr/lib/libSystem.B.dylib"); umbrella->reExports = {standIn, c};
+        sAllImages.push_back(umbrella); sAllImages.push_back(standIn); sAllImages.push_back(c); sDiskOverridesOfCacheImages.push_back({standIn, 1});
+        overrideSplitCacheGotSlots();
+        return std::make_pair(standIn, c);
+      };
+      for (bool inSibling : {false, true}) {
+        auto images = resolverCase(inSibling, 1);
+        CHECK(images.first->resolverRuns == 0 && images.second->resolverRuns == 0 && images.first->resolverFaults == 0 && images.second->resolverFaults == 0);
+        CHECK(images.first->resolverStubLookups + images.second->resolverStubLookups == 1);       // looked up, as the stub
+        CHECK(cache.lastAddress["_close"] == (0x2000 | dyld3::darling::kThunkBit));              // the stub, which runs the resolver through its lazy pointer on first call
+        CHECK(cache.lastAddress["_open"] == (0x1000 | dyld3::darling::kThunkBit));              // the other exports are as before
+        resolverCase(inSibling, 2);
+        CHECK(cache.lastAddress["_close"] == 0x2000);                                            // arm64e: the stub as it is
+      }
 
       // --- the log function is passed under the cache policy option too ---
       reset(cache); sAllImages.push_back(image("/usr/lib/libz.1.dylib", true)); shadow("/usr/lib/libSystem.B.dylib", 0);
