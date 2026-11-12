@@ -3713,7 +3713,7 @@ static void recordDiskOverrideOfCacheImage(const ImageLoader* image, const dyld3
 	// l6 scratch: an image loaded through DYLD_LIBRARY_PATH (or any other substituted path) is not found in the cache by
 	// that path, but its install name may be a cache image; the cache's code imports it by that name
 	if ( (found.cacheImageIndex == dyld3::kNoCacheImageIndex) && (image->getInstallPath() != nullptr)
-	  && sSharedCacheLoadInfo.loadAddress->isSplitCache() ) {
+	  && (sSharedCacheLoadInfo.loadAddress != nullptr) && sSharedCacheLoadInfo.loadAddress->isSplitCache() ) {
 		found.image = nullptr;
 		dyld3::findInSharedCacheImage(sSharedCacheLoadInfo, image->getInstallPath(), &found);
 	}
