@@ -1918,6 +1918,12 @@ bool _dyld_shared_cache_optimized()
     return false;
 }
 
+// l6 scratch: dyld-1378 DyldAPIs.cpp:4116-4128 answers null when prespecialization is disabled or the cache has none
+const void* _dyld_get_swift_prespecialized_data(void)
+{
+    return NULL;
+}
+
 bool _dyld_shared_cache_is_locally_built()
 {
     if ( gUseDyld3 )

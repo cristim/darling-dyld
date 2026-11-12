@@ -784,6 +784,14 @@ extern bool _dyld_shared_cache_optimized(void);
 // Exists in iOS 13.0 and later
 extern bool _dyld_shared_cache_is_locally_built(void);
 
+// Called only by the Swift runtime to find the shared cache's prespecialized metadata. NULL when there is none
+// (dyld-1378 DyldAPIs.cpp:4111-4137); Darling's loader has no such data to offer.
+extern const void* _dyld_get_swift_prespecialized_data(void);
+
+// Called only by the Swift runtime to find the shared cache's prespecialized metadata. NULL when there is none
+// (dyld-1378 DyldAPIs.cpp:4111-4137); Darling's loader has no such data to offer.
+extern const void* _dyld_get_swift_prespecialized_data(void);
+
 //
 // Returns if the given app needs a closure built.
 //
