@@ -79,7 +79,19 @@
 	static void* darlingDlsymSignForCaller(void* result, void* callerAddress, const char* machoName)
 	{
 		const ImageLoader* callerImage = dyld::findImageContainingAddress(callerAddress);
-		if ( (callerImage == NULL) || !dyld3::darling::cpusubtypeIsArm64e(callerImage->machHeader()->cpusubtype) )
+		// findImageContainingAddress only knows the mapped ranges of images loaded from disk, not the split cache's: a caller inside the
+		// cache's region is a cache image, and every image of an arm64e cache is arm64e (cache code that soft-links through dlsym
+		// would otherwise be handed a plain pointer, and fail authentication when it calls it)
+		bool callerIsArm64e = false;
+		if ( callerImage != NULL ) {
+			callerIsArm64e = dyld3::darling::cpusubtypeIsArm64e(callerImage->machHeader()->cpusubtype);
+		}
+		else {
+			const DyldSharedCache* cache = (const DyldSharedCache*)dyld::imMemorySharedCacheHeader();
+			callerIsArm64e = (cache != nullptr) && ((uintptr_t)callerAddress >= (uintptr_t)cache)
+						  && ((uintptr_t)callerAddress < (uintptr_t)cache + (uintptr_t)cache->mappedSize());
+		}
+		if ( !callerIsArm64e )
 			return result;
 		// a callback-taking export of a plain image is handed out as the thunk that authenticates the caller's signatures
 		const ImageLoader* resultImage = dyld::findImageContainingAddress(result);
