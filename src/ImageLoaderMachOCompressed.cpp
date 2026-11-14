@@ -47,6 +47,9 @@
 #ifdef DARLING
 #include "DarlingArm64eAdapters.h"
 #endif
+#ifdef DARLING
+#include "DarlingCollectMissing.h"
+#endif
 
 #ifndef BIND_SUBOPCODE_THREADED_SET_JOP
    #define BIND_SUBOPCODE_THREADED_SET_JOP								0x0F
@@ -628,6 +631,21 @@ const char* ImageLoaderMachOCompressed::importedSymbolName(const Symbol* symbol)
 
 
 
+#ifdef DARLING
+// DARLING_DYLD_COLLECT_MISSING (dyld3/DarlingCollectMissing.h): an unresolved import is recorded and bound to something that
+// fails loudly when used, instead of ending the launch. sBindKind is what the bind in progress is, set by bindAt (the lazy
+// and non-lazy opcode binds); chained fixups and the other callers of resolve() leave it unknown.
+static dyld3::darling::BindKind sBindKind = dyld3::darling::BindKind::Unknown;
+
+static uintptr_t darlingCollectMissing(const ImageLoader* referrer, const char* symbolName, const char* expectedIn, long ordinal, bool weak)
+{
+	const char* referrerName = referrer->getInstallPath();
+	if ( (referrerName == NULL) || (referrerName[0] == '\0') || (referrerName[0] == '@') )
+		referrerName = referrer->getPath();
+	return dyld3::darling::collectMissingBind({ referrerName, symbolName, expectedIn, ordinal, weak, sBindKind });
+}
+#endif
+
 uintptr_t ImageLoaderMachOCompressed::resolveFlat(const LinkContext& context, const char* symbolName, bool weak_import, 
 													bool runResolver, const ImageLoader** foundIn)
 {
@@ -644,6 +662,10 @@ uintptr_t ImageLoaderMachOCompressed::resolveFlat(const LinkContext& context, co
 		if ( sym != NULL )
 			return (*foundIn)->getExportedSymbolAddress(sym, context, this, runResolver);
 	}
+#ifdef DARLING
+	if ( dyld3::darling::collectMissingEnabled() )
+		return darlingCollectMissing(this, symbolName, "flat", 0, weak_import);
+#endif
 	if ( weak_import ) {
 		// definition can't be found anywhere, ok because it is weak, just return 0
 		return 0;
@@ -742,6 +764,10 @@ uintptr_t ImageLoaderMachOCompressed::resolveWeak(const LinkContext& context, co
 		if ( sym != NULL )
 			return (*foundIn)->getExportedSymbolAddress(sym, context, this, runResolver);
 	}
+#ifdef DARLING
+	if ( dyld3::darling::collectMissingEnabled() )
+		return darlingCollectMissing(this, symbolName, "weak-lookup", BIND_SPECIAL_DYLIB_WEAK_LOOKUP, weak_import);
+#endif
 	if ( weak_import ) {
 		// definition can't be found anywhere, ok because it is weak, just return 0
 		return 0;
@@ -759,6 +785,14 @@ uintptr_t ImageLoaderMachOCompressed::resolveTwolevel(const LinkContext& context
 	if ( definedInImage->findExportedSymbolAddress(context, symbolName, requestorImage, requestorOrdinalOfDef, runResolver, foundIn, &address) )
 		return address;
 
+#ifdef DARLING
+	if ( dyld3::darling::collectMissingEnabled() ) {
+		const char* expectedIn = definedInImage->getInstallPath();
+		if ( (expectedIn == NULL) || (expectedIn[0] == '\0') )
+			expectedIn = definedInImage->getPath();
+		return darlingCollectMissing(this, symbolName, expectedIn, (long)requestorOrdinalOfDef, weak_import);
+	}
+#endif
 	if ( weak_import ) {
 		// definition can't be found anywhere, ok because it is weak, just return 0
 		return 0;
@@ -939,8 +973,16 @@ uintptr_t ImageLoaderMachOCompressed::bindAt(const LinkContext& context, ImageLo
     if (type == BIND_TYPE_THREADED_REBASE) {
         symbolAddress = 0;
         targetImage = nullptr;
-    } else
+    } else {
+#ifdef DARLING
+		// "" is the plain opcode bind, "lazy " and "forced lazy " the lazy ones, "weak " never gets here
+		sBindKind = (msg[0] == '\0') ? dyld3::darling::BindKind::NonLazy : (strstr(msg, "lazy") != NULL) ? dyld3::darling::BindKind::Lazy : dyld3::darling::BindKind::Unknown;
+#endif
         symbolAddress = image->resolve(context, symbolName, symbolFlags, libraryOrdinal, &targetImage, patcher, last, runResolver);
+#ifdef DARLING
+		sBindKind = dyld3::darling::BindKind::Unknown;
+#endif
+    }
 #ifdef DARLING
 	// a plain image's dyld-info and lazy binds of an arm64e export (the cache's libc++abi): the opposite direction
 	if ( type != BIND_TYPE_THREADED_REBASE )
