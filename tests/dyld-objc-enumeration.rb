@@ -80,6 +80,7 @@ STUBS = <<~'CPP'.chomp
   typedef void (*_dyld_objc_notify_mapped)(unsigned, const char* const[], const struct mach_header* const[]);
   typedef void (*_dyld_objc_notify_init)(const char*, const struct mach_header*);
   typedef void (*_dyld_objc_notify_unmapped)(const char*, const struct mach_header*);
+  typedef void (*_dyld_objc_notify_patch_class)(const struct mach_header*, void*, const struct mach_header*, const void*);
   struct ImageLoader {
       bool inCache;
       bool inSharedCache() const { return inCache; }
@@ -92,6 +93,7 @@ STUBS = <<~'CPP'.chomp
           uintptr_t version = 0;
           void* mapped2 = nullptr;
           void* mapped3 = nullptr;
+          _dyld_objc_notify_patch_class patches = nullptr;
           void (*markImageMutableInvoke)(void*, uint32_t) = nullptr;
           void (*logSkip)(const char*, const char*) = nullptr;
           void (*logRegistered)(unsigned) = nullptr;
@@ -139,6 +141,7 @@ STUBS = <<~'CPP'.chomp
       static ImageLoader* findImageContainingAddress(const void* address);
       static void halt(const char*) { __builtin_trap(); }
       static void registerObjCNotifiers(_dyld_objc_notify_mapped, _dyld_objc_notify_init, _dyld_objc_notify_unmapped);
+      static void registerObjCPatchNotifier(_dyld_objc_notify_patch_class);
   }
 CPP
 
@@ -172,9 +175,14 @@ PRELUDE = [
     static unsigned gReplays;
     namespace dyld {
         // The mapped replay reaches the table SPIs, so what they see here is what libobjc would see.
+        // The patch callback goes to the loader before the mapped replay (objc patches classes that nothing has realized yet).
+        static bool gPatchPending, gReplayWithoutPatch;
+        static void registerObjCPatchNotifier(_dyld_objc_notify_patch_class) { gPatchPending = true; }
         static void registerObjCNotifiers(_dyld_objc_notify_mapped, _dyld_objc_notify_init, _dyld_objc_notify_unmapped)
         {
             ++gReplays;
+            if ( !gPatchPending ) gReplayWithoutPatch = true;
+            gPatchPending = false;
             gGateAtReplay = (objcRuntimeCache() != nullptr);
         }
     }
@@ -683,6 +691,7 @@ DRIVER = <<~'CPP'
       gGateAtReplay = false;
       _dyld_objc_notify_register(nullptr, nullptr, nullptr);
       expect("the old-shape registration replays and leaves the gate off", gReplays == 1 && !gGateAtReplay && !dyld::gObjCRuntimeIsSharedCache);
+      expect("every registration tells the loader about the patch callback before its replay, the old shape with none", !dyld::gReplayWithoutPatch);
       dyld::gObjCRuntimeIsSharedCache = true;   // the walker cases below need the cache's tables
   }
 

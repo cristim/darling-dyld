@@ -115,6 +115,7 @@ namespace dyld {
 	extern void					registerImageStateSingleChangeHandler(dyld_image_states state, dyld_image_state_change_handler handler);
 	extern void					registerImageStateBatchChangeHandler(dyld_image_states state, dyld_image_state_change_handler handler);
 	extern void					registerObjCNotifiers(_dyld_objc_notify_mapped, _dyld_objc_notify_init, _dyld_objc_notify_unmapped);
+	extern void					registerObjCPatchNotifier(_dyld_objc_notify_patch_class patches);
 	extern bool					sharedCacheUUID(uuid_t uuid);
 	extern void					garbageCollectImages();
 	extern const void*			imMemorySharedCacheHeader();

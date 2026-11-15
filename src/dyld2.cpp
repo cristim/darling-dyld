@@ -1797,6 +1797,86 @@ static struct { uint64_t patched, missing, unexplained, plainPatched, plainMissi
 // patched later).
 static std::vector<bool> sCacheImagesSeen;
 
+// A class of a replaced cache image that a disk image defines in its place. The override above redirects the pointers that cache
+// images hold through their GOT and plain locations, but the cache's own class object stays what it is: objc's tables and any
+// subclass or instance of the cache's copy still reach it, and it was never registered because its image is not loaded. dyld4 hands
+// each such pair to the objc runtime's patch_class callback (RuntimeState::notifyObjCPatching, open source dyld), which makes the
+// cache's class object take the replacement's isa, superclass and read-only data (objc4 _objc_patch_root_of_class,
+// objc-os.mm). The runtime registers that callback after the launch pass, so the pairs wait here until it does.
+struct ObjCClassReplacement {
+	const mach_header*	cacheMH;
+	uintptr_t			cacheClass;
+	const mach_header*	replacementMH;
+	uintptr_t			replacementClass;
+	std::string			symbol;				// _OBJC_CLASS_$_Name or _OBJC_METACLASS_$_Name
+	std::string			cachePath;
+	std::string			replacementPath;
+};
+static std::vector<ObjCClassReplacement> sObjCClassReplacements;	// found, not yet handed to the runtime
+static std::vector<uintptr_t> sObjCClassesNoted;					// cache class addresses already found: a later pass for a new client asks again
+static _dyld_objc_notify_patch_class sNotifyObjCPatch = nullptr;
+static bool sObjCRuntimeRegistered = false;
+static bool sObjCPatchMissingReported = false;
+
+// objc4 objc-runtime-new.h: class bits, at the offset after isa, superclass and the two words of the method cache; bit 0 is a
+// legacy Swift class, bit 1 a stable one. objc's patch handler refuses Swift classes, and dyld4 never offers one.
+static bool objcClassIsSwift(uintptr_t cls)
+{
+	return (*(const uintptr_t*)(cls + 4 * sizeof(uintptr_t)) & 3) != 0;
+}
+
+// The exports of an Objective-C class and of its metaclass, by name (objc4 and the ABI both name them so).
+static bool isObjCClassExportName(const char* symbol)
+{
+	return (strncmp(symbol, "_OBJC_CLASS_$_", 14) == 0) || (strncmp(symbol, "_OBJC_METACLASS_$_", 18) == 0);
+}
+
+// Records one pair for the runtime. dyld4's eligibility, as far as this loader can evaluate it: not a Swift class on either side, and
+// not a class of a library that keeps data next to its classes (libdispatch's vtable, libxpc: JustInTimeLoader.cpp
+// isEligibleForObjCPatching). Its bind-to-self test on the chained fixups of the root has no equivalent here: the replacement's
+// export address is its class. Names only in the log.
+static void noteObjCClassReplacement(std::vector<ObjCClassReplacement>& found, const char* symbol, uintptr_t cacheClass, const mach_header* cacheMH,
+									 const char* cachePath, const ImageLoader* replacement, uintptr_t replacementClass)
+{
+	if ( !isObjCClassExportName(symbol) )
+		return;
+	if ( (strstr(cachePath, "libdispatch.dylib") != nullptr) || (strstr(cachePath, "libxpc.dylib") != nullptr) )
+		return;
+	if ( objcClassIsSwift(cacheClass) || objcClassIsSwift(replacementClass) ) {
+		if ( gLogCachePolicy )
+			dyld::log("dyld: objc patch skipped, a Swift class: %s of %s\n", symbol, cachePath);
+		return;
+	}
+	if ( std::find(sObjCClassesNoted.begin(), sObjCClassesNoted.end(), cacheClass) != sObjCClassesNoted.end() )
+		return;
+	sObjCClassesNoted.push_back(cacheClass);
+	found.push_back({ cacheMH, cacheClass, replacement->machHeader(), replacementClass, symbol, cachePath, replacement->getPath() });
+}
+
+// Hands the pairs found so far to the runtime once it has registered its callback, before the mapped notification that makes it read
+// the replacement's metadata: the replacement must still be unrealized (objc asserts so), and a pass runs before the bound notification.
+// A runtime that registered without a patch callback cannot be told: said once, loudly, and the pairs are dropped.
+static void deliverObjCClassPatches()
+{
+	if ( sObjCClassReplacements.empty() || !sObjCRuntimeRegistered )
+		return;
+	if ( sNotifyObjCPatch == nullptr ) {
+		if ( !sObjCPatchMissingReported )
+			dyld::log("dyld: the objc runtime registered no patches callback: %llu class(es) of replaced cache images keep the cache's own class objects, unregistered\n",
+					  (unsigned long long)sObjCClassReplacements.size());
+		sObjCPatchMissingReported = true;
+		sObjCClassReplacements.clear();
+		return;
+	}
+	for (const ObjCClassReplacement& r : sObjCClassReplacements) {
+		// dyld::log only, as in the override: this can run before libc's locale state is usable
+		if ( gLogCachePolicy )
+			dyld::log("dyld: objc patch %s: %s of %s replaced by %s\n", (r.symbol[6] == 'M') ? "metaclass" : "class", r.symbol.c_str(), r.cachePath.c_str(), r.replacementPath.c_str());
+		(*sNotifyObjCPatch)(r.cacheMH, (void*)r.cacheClass, r.replacementMH, (const void*)r.replacementClass);
+	}
+	sObjCClassReplacements.clear();
+}
+
 // An export can sit in another library of the libSystem family on Darling than in the cache: Apple's libsystem_malloc
 // exports reallocf, Darling's is in libsystem_c. The stand-in's clients reach both through the umbrella that re-exports
 // them, so look in the other re-exports of every loaded disk image that re-exports the stand-in. Otherwise the cache keeps
@@ -1883,7 +1963,11 @@ static void overrideSplitCacheGotSlots()
 		// a real cache leaves thousands of symbols to the cache (an empty libswiftCore stand-in: 3843): one line per exporter, not per symbol
 		struct { uint64_t count; const char* first[3]; } initialUndefined = { 0, { nullptr, nullptr, nullptr } };	// names point into the cache's string table, which stays mapped
 		__block decltype(initialUndefined) undefined = initialUndefined;
-		const char* error = cache->overridePatchGotSlots(record.cacheImageIndex, ^(const char* symbol, bool classExport, uint64_t, uint64_t* address) {
+		uint64_t cacheImageMTime, cacheImageNode;
+		const mach_header* const cacheImageMH = cache->getIndexedImageEntry(record.cacheImageIndex, cacheImageMTime, cacheImageNode);
+		const char* const cacheImagePath = cache->getIndexedImagePath(record.cacheImageIndex);
+		__block std::vector<ObjCClassReplacement> replacedClasses;
+		const char* error = cache->overridePatchGotSlots(record.cacheImageIndex, ^(const char* symbol, bool classExport, uint64_t cacheAddress, uint64_t* address) {
 			const ImageLoader* foundIn;
 			uintptr_t found;
 			if ( image->findExportedSymbolAddress(gLinkContext, symbol, nullptr, -1, true, &foundIn, &found) || findInReExportSiblings(image, symbol, &foundIn, &found) ) {
@@ -1894,6 +1978,8 @@ static void overrideSplitCacheGotSlots()
 						dyld::log("dyld: split cache GOT override: %s of %s is a class export of a non-arm64e image, the cache's pointer stays\n", symbol, foundIn->getPath());
 					return false;
 				}
+				if ( classExport )
+					noteObjCClassReplacement(replacedClasses, symbol, (uintptr_t)cacheAddress, cacheImageMH, cacheImagePath, foundIn, found);
 				// the importer is a cache image, which is arm64e; a callback-taking export of a plain image gets a thunk. found is
 				// the exporter's own definition, so unlike a resolved bind it can never be an interposer's address
 				*address = dyld3::darling::adaptedTarget(symbol, found, foundInIsArm64e);
@@ -1910,6 +1996,7 @@ static void overrideSplitCacheGotSlots()
 		}, (done && !anyNewClient) ? (int (^)(uint32_t))nullptr : clientAction, (verbose || gLogCachePolicy) ? &dyld::log : nullptr, &stats);
 		if ( error != nullptr )
 			halt(mkstringf("split cache GOT override of '%s': %s\n", installPath, error));
+		sObjCClassReplacements.insert(sObjCClassReplacements.end(), replacedClasses.begin(), replacedClasses.end());
 		sSplitCachePatchTotals.plainPatched += stats.plainPatched;
 		sSplitCachePatchTotals.plainMissing += stats.plainMissing;
 		sSplitCachePatchTotals.plainUnexplained += stats.plainUnexplained;
@@ -1935,6 +2022,7 @@ static void overrideSplitCacheGotSlots()
 		sSplitCachePatchTotals.unexplained += stats.unexplained;
 		newUnexplained += stats.unexplained;
 	}
+	deliverObjCClassPatches();
 	for (size_t index = 0; index != clientActions.size(); ++index) {
 		if ( clientActions[index] == DyldSharedCache::kPlainClientIgnore )
 			continue;
@@ -5258,6 +5346,16 @@ void registerImageStateBatchChangeHandler(dyld_image_states state, dyld_image_st
 	}
 }
 
+
+#ifdef DARLING
+// Called by the registering runtime before registerObjCNotifiers, with the patches callback it passed or null when it passed none.
+void registerObjCPatchNotifier(_dyld_objc_notify_patch_class patches)
+{
+	sNotifyObjCPatch = patches;
+	sObjCRuntimeRegistered = true;
+	deliverObjCClassPatches();
+}
+#endif
 
 void registerObjCNotifiers(_dyld_objc_notify_mapped mapped, _dyld_objc_notify_init init, _dyld_objc_notify_unmapped unmapped)
 {

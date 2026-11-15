@@ -16,6 +16,7 @@ dyld2_h = File.read("#{root}/src/dyld2.h")
 runtime = File.read("#{root}/dyld3/SharedCacheRuntime.cpp")
 runtime_h = File.read("#{root}/dyld3/SharedCacheRuntime.h")
 override_fn = dyld2[/^static struct \{[^}]*\} sSplitCachePatchTotals;.*?^static void overrideSplitCacheGotSlots\(\).*?^\}/m] or abort 'overrideSplitCacheGotSlots missing'
+register_fn = dyld2[/^void registerObjCPatchNotifier\(.*?^\}/m] or abort 'registerObjCPatchNotifier missing'
 record_struct = dyld2_h[/^\tstruct DiskOverrideOfCacheImage \{.*?^\t\};/m] or abort 'DiskOverrideOfCacheImage missing'
 allow_list = runtime[/^static const char\* const kSharedCacheServedOverDisk\[\].*?^bool sharedCachePathIsAllowListed\(.*?^\}/m] or abort 'allow-list code missing'
 allow_decl = runtime_h[/^struct SharedCacheAllowList \{.*?^\};/m] or abort 'SharedCacheAllowList missing'
@@ -65,6 +66,7 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
     #include <map>
     #include <set>
     #include <stdexcept>
+    #include <algorithm>
     extern "C" { void *_NSConcreteStackBlock[32]; void *_NSConcreteGlobalBlock[32];
                  void _Block_object_assign(void*, const void*, const int) {}
                  void _Block_object_dispose(const void*, const int) {} }
@@ -82,6 +84,7 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
         inline uint64_t adaptedTarget(const char *symbol, uint64_t target, bool targetIsArm64e) { return targetIsArm64e ? target : target | kThunkBit; }
       }
     }
+    typedef void (*_dyld_objc_notify_patch_class)(const struct mach_header* originalMH, void* originalClass, const struct mach_header* replacementMH, const void* replacementClass);
     struct mach_header { int cpusubtype; uint32_t cacheIndex = 0; };   // cacheIndex: where the cache lists the image, for the images that are in it
     // The cache: which images it has, whether it has version 4 patch info, and what overridePatchGotSlots does.
     struct DyldSharedCache {
@@ -93,6 +96,9 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
       mutable std::vector<uint32_t> calls; mutable std::set<uint32_t> applied;
       const char *error = nullptr;                 // what overridePatchGotSlots returns for index 2
       bool hasPatchInfoV4() const { return patchInfo; }
+      mutable std::map<uint32_t, mach_header> headers;   // the cache's own copy of each image's mach header
+      const mach_header *getIndexedImageEntry(uint32_t i, uint64_t &, uint64_t &) const { return &headers[i]; }
+      mutable std::map<std::string, uint64_t> cacheAddressOf;     // where the cache's own copy of an export is
       const char *getIndexedImagePath(uint32_t i) const { return images[i].c_str(); }
       bool patchOverrideDone(uint32_t index) const { return applied.count(index) != 0; }
       bool findMachHeaderImageIndex(const mach_header *mh, uint32_t &index) const { index = mh->cacheIndex; return true; }
@@ -115,7 +121,7 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
           const char *name = nameString.c_str();
           uint64_t address = 0;
           if (wasApplied && patchClients == 0) break;
-          const bool found = resolve(name, classNames.count(name) != 0, 0, &address);
+          const bool found = resolve(name, classNames.count(name) != 0, cacheAddressOf[name], &address);
           if (found) lastAddress[name] = address;
           if (!wasApplied) { ++s->exports; s->slots += 2; if (found) s->patched += 2; else { ++s->missingExports; s->missingSlots += 2; } }
           s->plainSlots += patchClients; (found ? s->plainPatched : s->plainMissing) += patchClients;
@@ -162,6 +168,7 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
       const char *mkstringf(const char *format, ...) { static char buffer[512]; va_list a; va_start(a, format); vsnprintf(buffer, sizeof buffer, format, a); va_end(a); return buffer; }
       void halt(const char *message) { throw std::runtime_error(message); }
       #{override_fn}
+      #{register_fn}
       // The bound notification: the add-image callbacks run for every cache image that has not been notified yet. libdyld's (a disk-served stand-in)
       // is tlv_initialize_descriptors, which stores signed tlv_get_addr in the thunk of each new image's TLV descriptors.
       enum dyld_image_states { dyld_image_state_bound = 60 };
@@ -187,7 +194,7 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
     }
     // a disk image standing in for cache image `index`, as loadPhase5 records it
     static void shadow(const char *install, uint32_t index) { ImageLoader *i = image(install); sAllImages.push_back(i); sDiskOverridesOfCacheImages.push_back({i, index}); }
-    static void reset(DyldSharedCache &cache) { sAllImages.clear(); sDiskOverridesOfCacheImages.clear(); cache.calls.clear(); cache.applied.clear(); sCacheImagesSeen.clear(); cache.lastAddress.clear(); cache.logOn.clear(); cache.actionNull.clear(); cache.patchedClients.clear(); cache.thunk.clear(); sCacheImagesSeen.clear(); cache.classNames.clear(); cache.moreNames.clear(); cache.error = nullptr; cache.patchInfo = true; logged.clear(); }
+    static void reset(DyldSharedCache &cache) { sAllImages.clear(); sDiskOverridesOfCacheImages.clear(); cache.calls.clear(); cache.applied.clear(); sCacheImagesSeen.clear(); cache.lastAddress.clear(); cache.logOn.clear(); cache.actionNull.clear(); cache.patchedClients.clear(); cache.thunk.clear(); sCacheImagesSeen.clear(); cache.classNames.clear(); cache.moreNames.clear(); cache.cacheAddressOf.clear(); sObjCClassReplacements.clear(); sObjCClassesNoted.clear(); sNotifyObjCPatch = nullptr; sObjCRuntimeRegistered = false; sObjCPatchMissingReported = false; cache.error = nullptr; cache.patchInfo = true; logged.clear(); }
     static unsigned summaries() { unsigned n = 0; for (const std::string &l : logged) n += l.find("split cache GOT override: patched=") != std::string::npos; return n; }
 
     int main() {
@@ -454,6 +461,85 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
       overrideSplitCacheGotSlots();
       CHECK((cache.logOn == std::vector<bool>{true}));
       gLogCachePolicy = false;
+
+      // --- the objc classes of a replaced cache image reach the runtime's patch callback (dyld4's notifyObjCPatching), once it has registered ---
+      // The cache's copy of each export and the stand-in's definition are real memory, because the loader reads the class bits (offset 32) to leave Swift classes alone.
+      {
+        static uintptr_t cacheClass[8][8], ourClass[8][8];
+        memset(cacheClass, 0, sizeof cacheClass); memset(ourClass, 0, sizeof ourClass);
+        ourClass[2][4] = 2;                                                 // SwiftReplacement: a stable Swift class in the stand-in
+        cacheClass[3][4] = 1;                                               // SwiftCache: a legacy Swift class in the cache
+        struct Call { const mach_header *originalMH; void *original; const mach_header *replacementMH; const void *replacement; };
+        static std::vector<Call> calls;
+        calls.clear();
+        static void (*recordFn)(const mach_header*, void*, const mach_header*, const void*) = nullptr;
+        struct Rec { static void patch(const mach_header *a, void *b, const mach_header *c, const void *d) { calls.push_back({a, b, c, d}); } };
+        recordFn = &Rec::patch;
+        const char *classNamesUnderTest[] = {"_OBJC_CLASS_$_A", "_OBJC_METACLASS_$_A", "_OBJC_CLASS_$_SwiftReplacement", "_OBJC_CLASS_$_SwiftCache"};
+        auto setup = [&](int subtype, const char *cacheInstall) {
+          reset(cache); calls.clear();
+          sAllImages.push_back(image("/usr/lib/libz.1.dylib", true));
+          ImageLoader *standIn = image("/usr/lib/system/libsystem_kernel.dylib"); standIn->header.cpusubtype = subtype;
+          cache.images[1] = cacheInstall; cache.headers[1].cpusubtype = 77;
+          for (int i = 0; i != 4; ++i) {
+            standIn->exports[classNamesUnderTest[i]] = (uintptr_t)ourClass[i]; cache.cacheAddressOf[classNamesUnderTest[i]] = (uintptr_t)cacheClass[i];
+            cache.moreNames.push_back(classNamesUnderTest[i]); cache.classNames.insert(classNamesUnderTest[i]);
+          }
+          cache.classNames.insert("_open");                                 // a kind 8 export that is no objc class (an xpc type, a block class): redirected, never patched
+          standIn->exports["_open"] = (uintptr_t)ourClass[5]; cache.cacheAddressOf["_open"] = (uintptr_t)cacheClass[5];   // real memory, so a loader that took it for a class would read it
+          sAllImages.push_back(standIn); sDiskOverridesOfCacheImages.push_back({standIn, 1});
+          return standIn;
+        };
+        auto patchLines = [&]() { unsigned n = 0; for (const std::string &l : logged) n += l.find("dyld: objc patch ") != std::string::npos; return n; };
+        gLogCachePolicy = true;
+        ImageLoader *standIn = setup(2, "/usr/lib/system/libsystem_kernel.dylib");
+        overrideSplitCacheGotSlots();
+        CHECK(calls.empty() && sObjCClassReplacements.size() == 2);          // before the runtime registers, the pairs wait; the Swift ones were left out
+        CHECK(cache.lastAddress["_OBJC_CLASS_$_SwiftCache"] == (uintptr_t)ourClass[3]);   // the GOT redirect itself is unchanged by this
+        registerObjCPatchNotifier(recordFn);
+        CHECK(calls.size() == 2 && sObjCClassReplacements.empty());
+        CHECK(calls.size() >= 2 && calls[0].originalMH == &cache.headers[1] && calls[0].original == (void*)cacheClass[0] && calls[0].replacementMH == &standIn->header && calls[0].replacement == (const void*)ourClass[0]);
+        CHECK(calls.size() >= 2 && calls[1].original == (void*)cacheClass[1] && calls[1].replacement == (const void*)ourClass[1]);   // the metaclass is its own pair
+        CHECK(patchLines() == 4);                                           // two patches and the two Swift classes left out, one line each, names only
+        { bool sawClass = false, sawMeta = false, sawSwift = false;
+          for (const std::string &l : logged) { sawClass |= l == "dyld: objc patch class: _OBJC_CLASS_$_A of /usr/lib/system/libsystem_kernel.dylib replaced by /prefix/usr/lib/system/libsystem_kernel.dylib\\n";
+            sawMeta |= l.rfind("dyld: objc patch metaclass: _OBJC_METACLASS_$_A of ", 0) == 0; sawSwift |= l == "dyld: objc patch skipped, a Swift class: _OBJC_CLASS_$_SwiftCache of /usr/lib/system/libsystem_kernel.dylib\\n"; }
+          CHECK(sawClass && sawMeta && sawSwift); }
+        // another pass for a new client asks about the same exports again: nothing is delivered twice
+        cache.applied.clear(); sCacheImagesSeen.clear(); logged.clear();
+        overrideSplitCacheGotSlots();
+        CHECK(calls.size() == 2);
+        // a stand-in that arrives after the runtime registered is delivered in its own pass, before the bound notification
+        ImageLoader *later = image("/usr/lib/system/libsystem_c.dylib"); later->header.cpusubtype = 2; later->exports["_OBJC_CLASS_$_B"] = (uintptr_t)ourClass[4];
+        cache.cacheAddressOf["_OBJC_CLASS_$_B"] = (uintptr_t)cacheClass[4]; cache.moreNames = {"_OBJC_CLASS_$_B"}; cache.classNames.insert("_OBJC_CLASS_$_B");
+        sAllImages.push_back(later); sDiskOverridesOfCacheImages.push_back({later, 2}); cache.headers[2].cpusubtype = 88;
+        overrideSplitCacheGotSlots();
+        CHECK(calls.size() == 3 && calls[2].originalMH == &cache.headers[2] && calls[2].original == (void*)cacheClass[4] && calls[2].replacement == (const void*)ourClass[4]);
+        // a plain stand-in's classes are never patched (the arm64e runtime cannot realize them), whichever the runtime
+        setup(1, "/usr/lib/system/libsystem_kernel.dylib");
+        registerObjCPatchNotifier(recordFn);
+        overrideSplitCacheGotSlots();
+        CHECK(calls.empty() && sObjCClassReplacements.empty());
+        // libdispatch and libxpc keep data next to their classes: dyld4 never patches them
+        for (const char *excluded : {"/usr/lib/system/libdispatch.dylib", "/usr/lib/system/libxpc.dylib"}) {
+          setup(2, excluded); registerObjCPatchNotifier(recordFn);
+          overrideSplitCacheGotSlots();
+          CHECK(calls.empty() && sObjCClassReplacements.empty());
+        }
+        cache.images[1] = "/usr/lib/system/libsystem_kernel.dylib";
+        // a runtime that registered without a patch callback (the v1 notifier, or a v4 struct with a null field) is told apart from one that has not registered yet: said once, loudly
+        logged.clear(); setup(2, "/usr/lib/system/libsystem_kernel.dylib"); logged.clear();
+        registerObjCPatchNotifier(nullptr);
+        overrideSplitCacheGotSlots();
+        { unsigned missing = 0; for (const std::string &l : logged) missing += l == "dyld: the objc runtime registered no patches callback: 2 class(es) of replaced cache images keep the cache's own class objects, unregistered\\n"; CHECK(missing == 1); }
+        CHECK(calls.empty() && sObjCClassReplacements.empty());
+        later = image("/usr/lib/system/libsystem_c.dylib"); later->header.cpusubtype = 2; later->exports["_OBJC_CLASS_$_B"] = (uintptr_t)ourClass[4];
+        cache.cacheAddressOf["_OBJC_CLASS_$_B"] = (uintptr_t)cacheClass[4]; cache.moreNames = {"_OBJC_CLASS_$_B"}; cache.classNames.insert("_OBJC_CLASS_$_B");
+        sAllImages.push_back(later); sDiskOverridesOfCacheImages.push_back({later, 2}); logged.clear();
+        overrideSplitCacheGotSlots();
+        { unsigned missing = 0; for (const std::string &l : logged) missing += l.find("registered no patches callback") != std::string::npos; CHECK(missing == 0); }   // once per process
+        gLogCachePolicy = false;
+      }
 
       // --- a reader error halts, naming the exporter and the reason ---
       reset(cache);

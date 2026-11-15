@@ -2297,6 +2297,7 @@ void _dyld_objc_notify_register(_dyld_objc_notify_mapped    mapped,
                                 _dyld_objc_notify_init      init,
                                 _dyld_objc_notify_unmapped  unmapped)
 {
+	dyld::registerObjCPatchNotifier(nullptr);	// the v1 shape has no patch_class callback
 	dyld::registerObjCNotifiers(mapped, init, unmapped);
 }
 
@@ -2348,6 +2349,7 @@ void _dyld_objc_register_callbacks(const struct _dyld_objc_callbacks* callbacks)
 	}
 	if ( !state.registerCallbacks(callbacks) )
 		dyld::halt(state.error);
+	dyld::registerObjCPatchNotifier(state.patches);	// before the mapped replay: the runtime patches classes that have not been realized
 	latchObjCRuntime((state.version >= 3) ? (const void*)state.mapped3 : (const void*)state.mapped2);
 	dyld::registerObjCNotifiers(dyld3::darling::objcMappedThunk, dyld3::darling::objcInitThunk, dyld3::darling::objcUnmappedThunk);
 }
