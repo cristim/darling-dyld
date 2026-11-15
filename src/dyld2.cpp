@@ -1869,6 +1869,7 @@ static void deliverObjCClassPatches()
 		return;
 	}
 	for (const ObjCClassReplacement& r : sObjCClassReplacements) {
+		continue;	// SCRATCH: redirect only, never call objc
 		// dyld::log only, as in the override: this can run before libc's locale state is usable
 		if ( gLogCachePolicy )
 			dyld::log("dyld: objc patch %s: %s of %s replaced by %s\n", (r.symbol[6] == 'M') ? "metaclass" : "class", r.symbol.c_str(), r.cachePath.c_str(), r.replacementPath.c_str());
