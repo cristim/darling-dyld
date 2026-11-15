@@ -148,7 +148,7 @@ PATCH_CHECK = <<~'CPP'
       uint32_t index;
       if (!cache->hasImagePath(name.c_str(), index)) { printf("override %s: not in the cache\n", name.c_str()); assert(false); }
       DyldSharedCache::PatchOverrideStats stats;
-      const char *error = cache->overridePatchGotSlots(index, ^bool(const char *symbol, bool, uint64_t *address) { *address = stub(symbol); return true; }, clientAction, nullptr, &stats);
+      const char *error = cache->overridePatchGotSlots(index, ^bool(const char *symbol, bool, uint64_t, uint64_t *address) { *address = stub(symbol); return true; }, clientAction, nullptr, &stats);
       if (error) { printf("override %s: error: %s\n", name.c_str(), error); assert(false); }
       std::set<uint32_t> symbols; for (size_t i : slotsOf[index]) symbols.insert(allSlots[i].exportIndex);
       __block uint64_t plainLocations = 0;
@@ -168,7 +168,7 @@ PATCH_CHECK = <<~'CPP'
       assert(stats.plainPatched + stats.plainUnexplained == stats.plainSlots && stats.plainUnexplained == plainUnexplainedOfExporter[index]);
       totalPlainPatched += stats.plainPatched; totalPlainUnexplained += stats.plainUnexplained; totalPlainMissing += stats.plainMissing;
       DyldSharedCache::PatchOverrideStats again;
-      assert(cache->overridePatchGotSlots(index, ^bool(const char *, bool, uint64_t *) { assert(false); return false; }, nullptr, nullptr, &again) == nullptr && again.alreadyApplied);
+      assert(cache->overridePatchGotSlots(index, ^bool(const char *, bool, uint64_t, uint64_t *) { assert(false); return false; }, nullptr, nullptr, &again) == nullptr && again.alreadyApplied);
       patched.insert(index); totalSlots += stats.slots; totalPatched += stats.patched; totalUnexplained += stats.unexplained; totalMissing += stats.missingSlots;
     }
 

@@ -1883,7 +1883,7 @@ static void overrideSplitCacheGotSlots()
 		// a real cache leaves thousands of symbols to the cache (an empty libswiftCore stand-in: 3843): one line per exporter, not per symbol
 		struct { uint64_t count; const char* first[3]; } initialUndefined = { 0, { nullptr, nullptr, nullptr } };	// names point into the cache's string table, which stays mapped
 		__block decltype(initialUndefined) undefined = initialUndefined;
-		const char* error = cache->overridePatchGotSlots(record.cacheImageIndex, ^(const char* symbol, bool classExport, uint64_t* address) {
+		const char* error = cache->overridePatchGotSlots(record.cacheImageIndex, ^(const char* symbol, bool classExport, uint64_t, uint64_t* address) {
 			const ImageLoader* foundIn;
 			uintptr_t found;
 			if ( image->findExportedSymbolAddress(gLinkContext, symbol, nullptr, -1, true, &foundIn, &found) || findInReExportSiblings(image, symbol, &foundIn, &found) ) {

@@ -95,8 +95,9 @@ OVERRIDE_MAIN = <<~CPP
 
     // --- exporter 1 (libexpa): _beta has an export kind that is not understood, everything else is provided ---
     __block unsigned calls = 0; __block std::vector<std::string> seenSymbols; __block std::vector<std::string> permsAtResolve, otherAtResolve;
-    auto resolver = ^bool(const char *symbol, bool, uint64_t *address) {
-      ++calls; seenSymbols.push_back(symbol); permsAtResolve.push_back(permissions(f.gotMapAddr)); otherAtResolve.push_back(permissions(otherData));
+    __block std::map<std::string, uint64_t> cacheAddressOf;
+    auto resolver = ^bool(const char *symbol, bool, uint64_t cacheAddress, uint64_t *address) {
+      ++calls; seenSymbols.push_back(symbol); cacheAddressOf[symbol] = cacheAddress; permsAtResolve.push_back(permissions(f.gotMapAddr)); otherAtResolve.push_back(permissions(otherData));
       *address = stubAddress(symbol); return *address != 0;
     };
     DyldSharedCache::PatchOverrideStats stats;
@@ -110,6 +111,9 @@ OVERRIDE_MAIN = <<~CPP
     // writable only once the first write is about to happen: the first lookup still sees read-only, a later one sees writable
     CHECK(permsAtResolve[0] == "r--p" && permsAtResolve[2] == "rw-p");
     CHECK(permissions(f.gotMapAddr) == "r--p");                 // restored on return
+    // the resolver is told where the cache's own copy of each export is: its image's address plus the export's offset (the manifest's, not the reader's)
+    for (const Export &e : f.exports) { if (e.image == 1 && cacheAddressOf.count(e.name)) CHECK(cacheAddressOf[e.name] == f.images[e.image].first + e.impl); }
+    CHECK(cacheAddressOf.size() == 4 && cacheAddressOf.at("_alpha") != cacheAddressOf.at("_gamma"));
     CHECK(otherAtResolve == (std::vector<std::string>{"r--p", "r--p", "r--p", "r--p"}) && permissions(otherData) == "r--p");
 
     // --- exporter 2 (libexpb): _charlie is not provided, _unexplained has an encoding nobody can explain ---
@@ -204,7 +208,7 @@ OVERRIDE_MAIN = <<~CPP
     poke(nameWord, 4, (nameKind & 0x0fffffffu) | ((uint64_t)kind << 28));
     const Snapshot before = snapshot(f);
     __block std::vector<std::string> seenSymbols, classSymbols;
-    auto resolver = ^bool(const char *symbol, bool classExport, uint64_t *address) {
+    auto resolver = ^bool(const char *symbol, bool classExport, uint64_t cacheAddress, uint64_t *address) {
       seenSymbols.push_back(symbol); if (classExport) classSymbols.push_back(symbol);
       if (classExport && refuseClass) return false;
       *address = stubAddress(symbol); return *address != 0;
@@ -251,7 +255,7 @@ OVERRIDE_MAIN = <<~CPP
     poke(nameWord, 4, (nameKind & 0x0fffffffu) | (8u << 28));
     const Snapshot before = snapshot(f);
     __block std::vector<std::string> classSymbols;
-    auto resolver = ^bool(const char *symbol, bool classExport, uint64_t *address) {
+    auto resolver = ^bool(const char *symbol, bool classExport, uint64_t cacheAddress, uint64_t *address) {
       if (classExport) classSymbols.push_back(symbol);
       if (classExport && refuseClass) return false;
       *address = stubAddress(symbol); return *address != 0;
@@ -283,7 +287,7 @@ OVERRIDE_MAIN = <<~CPP
     const DyldSharedCache *cache = mapFixture(dir);
     const Snapshot before = snapshot(f);
     __block unsigned lookups = 0;
-    auto resolver = ^bool(const char *symbol, bool, uint64_t *address) { ++lookups; *address = stubAddress(symbol); return *address != 0; };
+    auto resolver = ^bool(const char *symbol, bool, uint64_t, uint64_t *address) { ++lookups; *address = stubAddress(symbol); return *address != 0; };
     auto patched = [&](const Snapshot &now, unsigned exporter, unsigned client, bool wantPatched, bool wantUnexplainedKept = true) {
       for (const Plain &p : f.plain) {
         if (p.exporter != exporter || p.client != client) continue;
@@ -339,7 +343,7 @@ OVERRIDE_MAIN = <<~CPP
     const DyldSharedCache *cache = mapFixture(dir);
     const Snapshot before = snapshot(f);
     DyldSharedCache::PatchOverrideStats stats;
-    auto good = ^bool(const char *symbol, bool, uint64_t *address) { *address = stubAddress(symbol); return *address != 0; };
+    auto good = ^bool(const char *symbol, bool, uint64_t, uint64_t *address) { *address = stubAddress(symbol); return *address != 0; };
     // The plain table of the exporter is validated in the override path, whichever clients are named (a client that is not loaded may be
     // loaded next): a location outside the mappings that carry slide info stops it before anything is written, the GOT included.
     {
@@ -356,7 +360,7 @@ OVERRIDE_MAIN = <<~CPP
     }
     // an address that does not fit the 48-bit pointer field of an authenticated pointer, however high its first stray bit is
     for (uint64_t stray : {1ull << 48, 1ull << 50, 1ull << 55, 1ull << 60}) {
-      CHECK_ERR(cache->overridePatchGotSlots(2, ^bool(const char *, bool, uint64_t *address) { *address = stray; return true; }, allClients, nullptr, &stats), "does not fit");
+      CHECK_ERR(cache->overridePatchGotSlots(2, ^bool(const char *, bool, uint64_t, uint64_t *address) { *address = stray; return true; }, allClients, nullptr, &stats), "does not fit");
     }
     CHECK(snapshot(f).words == before.words && permissions(f.gotMapAddr) == "r--p");
     // a GOT slot that is misaligned (the table check accepts it: it only needs the 8 bytes inside a mapping)
@@ -417,7 +421,7 @@ OVERRIDE_MAIN = <<~CPP
     std::vector<uint64_t> before((uint64_t *)data, (uint64_t *)(data + size));
     DyldSharedCache::PatchOverrideStats stats;
     CHECK(!cache->hasPatchInfoV4());
-    CHECK_ERR(cache->overridePatchGotSlots(0, ^bool(const char *, bool, uint64_t *) { CHECK(false); return false; }, allClients, nullptr, &stats), "outside the cache mappings");
+    CHECK_ERR(cache->overridePatchGotSlots(0, ^bool(const char *, bool, uint64_t, uint64_t *) { CHECK(false); return false; }, allClients, nullptr, &stats), "outside the cache mappings");
     CHECK(std::vector<uint64_t>((uint64_t *)data, (uint64_t *)(data + size)) == before && stats.patched == 0);
     printf(failures ? "RESULT failed (%d)\\n" : "RESULT ok\\n", failures);
     return failures != 0;

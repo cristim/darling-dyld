@@ -98,7 +98,7 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
       bool findMachHeaderImageIndex(const mach_header *mh, uint32_t &index) const { index = mh->cacheIndex; return true; }
       // Every image of the cache is a client of every exporter, with one plain location per symbol. Symbols the exporter has in its GOT: two the loaded
       // image defines and one it does not; index 4 has two unexplained slots, and index 5 only a refused plain location, per client to patch.
-      const char *overridePatchGotSlots(uint32_t index, bool (^resolve)(const char *symbol, bool classExport, uint64_t *address), int (^clientAction)(uint32_t), DataConstLogFunc logFunc, PatchOverrideStats *s) const {
+      const char *overridePatchGotSlots(uint32_t index, bool (^resolve)(const char *symbol, bool classExport, uint64_t cacheAddress, uint64_t *address), int (^clientAction)(uint32_t), DataConstLogFunc logFunc, PatchOverrideStats *s) const {
         calls.push_back(index); logOn.push_back(logFunc != nullptr); actionNull.push_back(clientAction == nullptr);
         memset(s, 0, sizeof *s);
         const bool wasApplied = applied.count(index) != 0;
@@ -115,7 +115,7 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
           const char *name = nameString.c_str();
           uint64_t address = 0;
           if (wasApplied && patchClients == 0) break;
-          const bool found = resolve(name, classNames.count(name) != 0, &address);
+          const bool found = resolve(name, classNames.count(name) != 0, 0, &address);
           if (found) lastAddress[name] = address;
           if (!wasApplied) { ++s->exports; s->slots += 2; if (found) s->patched += 2; else { ++s->missingExports; s->missingSlots += 2; } }
           s->plainSlots += patchClients; (found ? s->plainPatched : s->plainMissing) += patchClients;

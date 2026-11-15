@@ -1391,10 +1391,10 @@ struct ExportMemo {
 // kind 8 is inferred from observed exports (objc classes, Swift class metadata, concrete block classes, xpc type objects; not
 // defined in the open-source headers), other kinds are left alone. The resolver decides whether a kind 8 export may be
 // overridden: a plain libsystem_blocks or libxpc substitute leaves the __NSConcrete*Block and __xpc_type_* slots on the cache copy
-static ExportResolution& resolveExportOnce(const PatchTablesV4& t, ExportResolution* entries, const dyld_cache_image_patches_v4& p, uint32_t exportIndex,
-                                           bool (^resolve)(const char* symbol, bool classExport, uint64_t* address), DyldSharedCache::DataConstLogFunc logFunc)
+static ExportResolution& resolveExportOnce(const PatchTablesV4& t, ExportResolution* entries, uint32_t imageIndex, uint32_t exportIndex,
+                                           bool (^resolve)(const char* symbol, bool classExport, uint64_t cacheAddress, uint64_t* address), DyldSharedCache::DataConstLogFunc logFunc)
 {
-    ExportResolution& r = entries[exportIndex - p.exportsStartIndex];
+    ExportResolution& r = entries[exportIndex - t.patches[imageIndex].exportsStartIndex];
     if ( r.state != kExportUnseen )
         return r;
     const char* symbol = t.names + (t.exports[exportIndex].nameKind & 0x0fffffffu);
@@ -1404,7 +1404,8 @@ static ExportResolution& resolveExportOnce(const PatchTablesV4& t, ExportResolut
         if ( logFunc != nullptr )
             logFunc("dyld: locations of '%s' have an export kind that is not understood, left as the cache's pointers\n", symbol);
     }
-    else if ( resolve(symbol, kind == 8, &r.address) )
+    // the export's address in the cache's own copy of the image, which the resolver needs to tell objc which class a disk class replaces
+    else if ( resolve(symbol, kind == 8, t.images[imageIndex].address + t.slide + t.exports[exportIndex].dylibOffsetOfImpl, &r.address) )
         r.state = kExportResolved;
     else
         r.state = kExportMissing;
@@ -1465,7 +1466,7 @@ bool DyldSharedCache::patchOverrideDone(uint32_t imageIndex) const
     return (imageIndex < kMaxPatchableImages) && ((sPatchedExporters[imageIndex / 64] & (1ULL << (imageIndex % 64))) != 0);
 }
 
-const char* DyldSharedCache::overridePatchGotSlots(uint32_t imageIndex, bool (^resolve)(const char* symbol, bool classExport, uint64_t* address),
+const char* DyldSharedCache::overridePatchGotSlots(uint32_t imageIndex, bool (^resolve)(const char* symbol, bool classExport, uint64_t cacheAddress, uint64_t* address),
                                                     int (^clientAction)(uint32_t clientImageIndex), DataConstLogFunc logFunc, PatchOverrideStats* stats) const
 {
     memset(stats, 0, sizeof(*stats));
@@ -1505,7 +1506,7 @@ const char* DyldSharedCache::overridePatchGotSlots(uint32_t imageIndex, bool (^r
         const dyld_cache_got_client_export_v4& e = t.gotExports[i];
         ++stats->exports;
         stats->slots += e.locationsCount;
-        const ExportResolution& r = resolveExportOnce(t, memo.entries, p, e.imageExportIndex, resolve, logFunc);
+        const ExportResolution& r = resolveExportOnce(t, memo.entries, imageIndex, e.imageExportIndex, resolve, logFunc);
         if ( r.state == kExportKindNotUnderstood ) {
             stats->unexplained += e.locationsCount;
             continue;
@@ -1541,7 +1542,7 @@ const char* DyldSharedCache::overridePatchGotSlots(uint32_t imageIndex, bool (^r
         for (uint64_t j = client.exportsStartIndex; j != (uint64_t)client.exportsStartIndex + client.exportsCount; ++j) {
             const dyld_cache_patch_client_export_v4& e = t.clientExports[j];
             stats->plainSlots += e.locationsCount;
-            const ExportResolution& r = resolveExportOnce(t, memo.entries, p, e.imageExportIndex, resolve, logFunc);
+            const ExportResolution& r = resolveExportOnce(t, memo.entries, imageIndex, e.imageExportIndex, resolve, logFunc);
             if ( r.state == kExportKindNotUnderstood ) {
                 stats->plainUnexplained += e.locationsCount;
                 continue;

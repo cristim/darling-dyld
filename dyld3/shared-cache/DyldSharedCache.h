@@ -516,9 +516,11 @@ public:
     // are made writable, each around its writes. Not thread safe: the caller holds dyld's lock. Returns nullptr or why it stopped.
     // classExport is true for a kind 8 export (objc classes, Swift class metadata, block classes, xpc types), which resolve()
     // refuses for a plain image: an arm64e runtime never realizes its classes. A refusal counts as missing.
+    // cacheAddress is the address of the export in the cache's own copy of the image (the image's mapped address plus the export's
+    // offset), what a resolver that replaces a class hands to objc as the class being replaced.
     // True once the GOT of this exporter has been overridden: a new call needs a clientAction only for the clients that appeared since.
     bool patchOverrideDone(uint32_t imageIndex) const;
-    const char* overridePatchGotSlots(uint32_t imageIndex, bool (^resolve)(const char* symbol, bool classExport, uint64_t* address),
+    const char* overridePatchGotSlots(uint32_t imageIndex, bool (^resolve)(const char* symbol, bool classExport, uint64_t cacheAddress, uint64_t* address),
                                       int (^clientAction)(uint32_t clientImageIndex), DataConstLogFunc logFunc, PatchOverrideStats* stats) const;
 #endif
 
