@@ -1906,6 +1906,18 @@ static bool findInReExportSiblings(const ImageLoader* standIn, const char* symbo
 	return false;
 }
 
+// The disk image other than the stand-in that defines a class export, for a class that Darling keeps in another framework than Apple does.
+static bool findClassInOtherDiskImages(const ImageLoader* standIn, const char* symbol, const ImageLoader** foundIn, uintptr_t* address)
+{
+	for (const ImageLoader* other : sAllImages) {
+		if ( other == standIn || other->inSharedCache() )
+			continue;
+		if ( other->findExportedSymbolAddress(gLinkContext, symbol, nullptr, -1, true, foundIn, address) )
+			return true;
+	}
+	return false;
+}
+
 // The images of a split cache import through its coalesced GOT, whose slots the mapper has signed to the cache's own
 // exporters. For every cache exporter that this process provides from disk (the records loadPhase5 keeps of a disk
 // image standing in for a cache image), point the slots of the symbols it exports at the loaded image's definitions.
@@ -1970,7 +1982,15 @@ static void overrideSplitCacheGotSlots()
 		const char* error = cache->overridePatchGotSlots(record.cacheImageIndex, ^(const char* symbol, bool classExport, uint64_t cacheAddress, uint64_t* address) {
 			const ImageLoader* foundIn;
 			uintptr_t found;
-			if ( image->findExportedSymbolAddress(gLinkContext, symbol, nullptr, -1, true, &foundIn, &found) || findInReExportSiblings(image, symbol, &foundIn, &found) ) {
+			bool resolved = image->findExportedSymbolAddress(gLinkContext, symbol, nullptr, -1, true, &foundIn, &found) || findInReExportSiblings(image, symbol, &foundIn, &found);
+			// Darling's class can sit in another framework than Apple's (UIFont is in AppKit here, in UIFoundation there). The class is
+			// the same one by name, and the cache's copy is unregistered because its image is replaced, so it is taken from wherever it is defined.
+			if ( !resolved && classExport && isObjCClassExportName(symbol) && findClassInOtherDiskImages(image, symbol, &foundIn, &found) ) {
+				resolved = true;
+				if ( gLogCachePolicy )
+					dyld::log("dyld: objc class %s of %s is defined by %s, not by its stand-in\n", symbol, installPath, foundIn->getPath());
+			}
+			if ( resolved ) {
 				const bool foundInIsArm64e = dyld3::darling::cpusubtypeIsArm64e(foundIn->machHeader()->cpusubtype);
 				// an arm64e runtime never realizes the classes of a plain image, so cache code would get an unsigned class pointer
 				if ( classExport && !foundInIsArm64e ) {

@@ -541,6 +541,41 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
         gLogCachePolicy = false;
       }
 
+      // --- a class that Darling keeps in another framework than Apple does: the stand-in lacks it, another disk image defines it ---
+      {
+        static uintptr_t cacheKept[4], ourKept[4];
+        memset(cacheKept, 0, sizeof cacheKept); memset(ourKept, 0, sizeof ourKept);
+        struct Pair { const mach_header *originalMH; void *original; const mach_header *replacementMH; const void *replacement; };
+        static std::vector<Pair> pairs;
+        struct Rec { static void patch(const mach_header *a, void *b, const mach_header *c, const void *d) { pairs.push_back({a, b, c, d}); } };
+        auto run = [&](int ownerSubtype, bool ownerInCache, const char *name, bool standInAlso, bool kind8 = true) {
+          reset(cache); pairs.clear();
+          sAllImages.push_back(image("/usr/lib/libz.1.dylib", true));
+          ImageLoader *standIn = image("/usr/lib/system/libsystem_kernel.dylib"); standIn->header.cpusubtype = 2;
+          ImageLoader *owner = image("/usr/lib/system/libsystem_c.dylib"); owner->header.cpusubtype = ownerSubtype; owner->inCache = ownerInCache; owner->exports = {{name, (uintptr_t)ourKept}};
+          if ( standInAlso ) standIn->exports[name] = (uintptr_t)ourKept + 0x10;
+          cache.moreNames = {name}; if ( kind8 ) cache.classNames = {name}; cache.cacheAddressOf[name] = (uintptr_t)cacheKept;
+          sAllImages.push_back(owner); sAllImages.push_back(standIn); sDiskOverridesOfCacheImages.push_back({standIn, 1});
+          registerObjCPatchNotifier(&Rec::patch);
+          overrideSplitCacheGotSlots();
+        };
+        gLogCachePolicy = true;
+        run(2, false, "_OBJC_CLASS_$_Kept", false);
+        CHECK(cache.lastAddress["_OBJC_CLASS_$_Kept"] == (uintptr_t)ourKept && pairs.size() == 1 && pairs[0].original == (void*)cacheKept && pairs[0].replacement == (const void*)ourKept);
+        { bool said = false; for (const std::string &l : logged) said |= l == "dyld: objc class _OBJC_CLASS_$_Kept of /usr/lib/system/libsystem_kernel.dylib is defined by /prefix/usr/lib/system/libsystem_c.dylib, not by its stand-in\\n"; CHECK(said); }
+        run(2, false, "_OBJC_CLASS_$_Kept", true);                         // the stand-in's own definition wins, as for every other symbol
+        CHECK(cache.lastAddress["_OBJC_CLASS_$_Kept"] == (uintptr_t)ourKept + 0x10 && pairs.size() == 1 && pairs[0].replacement == (const void*)(ourKept + 2));
+        run(1, false, "_OBJC_CLASS_$_Kept", false);                        // a plain image's class is never taken (the arm64e runtime cannot realize it)
+        CHECK(cache.lastAddress.count("_OBJC_CLASS_$_Kept") == 0 && pairs.empty());
+        run(2, true, "_OBJC_CLASS_$_Kept", false);                         // nor is a cache image's own class: that is the cache's definition already
+        CHECK(cache.lastAddress.count("_OBJC_CLASS_$_Kept") == 0 && pairs.empty());
+        run(2, false, "_only_in_owner", false);                            // a kind 8 export that is no objc class (an xpc type, say) is not looked for elsewhere
+        CHECK(cache.lastAddress.count("_only_in_owner") == 0 && pairs.empty());
+        run(2, false, "_OBJC_CLASS_$_Kept", false, false);                 // an export that the cache does not list as a class (kind 8) is no class either
+        CHECK(cache.lastAddress.count("_OBJC_CLASS_$_Kept") == 0 && pairs.empty());
+        gLogCachePolicy = false;
+      }
+
       // --- a reader error halts, naming the exporter and the reason ---
       reset(cache);
       cache.error = "patch info is damaged";
