@@ -1826,6 +1826,61 @@ static bool findInReExportSiblings(const ImageLoader* standIn, const char* symbo
 	return false;
 }
 
+// Darling defines some classes in another framework than Apple does (UIFont is in the AppKit stand-in here, in UIFoundation there). The
+// cache's copy of such a class stays in its replaced, never loaded image, and objc aborts on the first message that reaches it ("no class
+// for metaclass"), so the cache's uses of a class that the stand-in of its image lacks go to the stand-in of another cache image that
+// defines it. This is a Darling rule with no Apple counterpart. Only images the loader itself records as stand-ins count, never the
+// main program, bundled frameworks, plugins or inserted libraries. The first definer in load order wins; a plain image is only the
+// answer when no arm64e image defines the class (the caller refuses it), and a second arm64e definer is named once, loudly.
+static const char* sClassConflictsReported[16];
+static unsigned sClassConflictsCount;
+static bool sClassRedirectLateReported = false;
+
+static bool findClassInOtherStandIns(const ImageLoader* standIn, const char* symbol, const ImageLoader** foundIn, uintptr_t* address)
+{
+	const ImageLoader* plainDefiner = nullptr;
+	uintptr_t plainAddress = 0;
+	const ImageLoader* winner = nullptr;
+	for (const ImageLoader* other : sAllImages) {
+		if ( other == standIn )
+			continue;
+		bool isStandIn = false;
+		for (const DiskOverrideOfCacheImage& record : sDiskOverridesOfCacheImages)
+			isStandIn |= (record.image == other);
+		const ImageLoader* definer;
+		uintptr_t definerAddress;
+		if ( !isStandIn || !other->findExportedSymbolAddress(gLinkContext, symbol, nullptr, -1, true, &definer, &definerAddress) )
+			continue;
+		if ( !dyld3::darling::cpusubtypeIsArm64e(definer->machHeader()->cpusubtype) ) {
+			if ( plainDefiner == nullptr ) {
+				plainDefiner = definer;
+				plainAddress = definerAddress;
+			}
+			continue;
+		}
+		if ( winner == nullptr ) {
+			winner = definer;
+			*address = definerAddress;
+			continue;
+		}
+		bool reported = false;
+		for (unsigned i = 0; i < sClassConflictsCount; ++i)
+			reported |= (sClassConflictsReported[i] == symbol);
+		if ( !reported ) {
+			if ( sClassConflictsCount < sizeof(sClassConflictsReported) / sizeof(sClassConflictsReported[0]) )
+				sClassConflictsReported[sClassConflictsCount++] = symbol;
+			if ( gLogCachePolicy )
+				dyld::log("dyld: objc class %s is defined by %s and by %s, the first in load order is used\n", symbol, winner->getPath(), definer->getPath());
+		}
+	}
+	if ( winner == nullptr ) {
+		winner = plainDefiner;
+		*address = plainAddress;
+	}
+	*foundIn = winner;
+	return winner != nullptr;
+}
+
 // The images of a split cache import through its coalesced GOT, whose slots the mapper has signed to the cache's own
 // exporters. For every cache exporter that this process provides from disk (the records loadPhase5 keeps of a disk
 // image standing in for a cache image), point the slots of the symbols it exports at the loaded image's definitions.
@@ -1886,7 +1941,22 @@ static void overrideSplitCacheGotSlots()
 		const char* error = cache->overridePatchGotSlots(record.cacheImageIndex, ^(const char* symbol, bool classExport, uint64_t* address) {
 			const ImageLoader* foundIn;
 			uintptr_t found;
-			if ( image->findExportedSymbolAddress(gLinkContext, symbol, nullptr, -1, true, &foundIn, &found) || findInReExportSiblings(image, symbol, &foundIn, &found) ) {
+			bool resolved = image->findExportedSymbolAddress(gLinkContext, symbol, nullptr, -1, true, &foundIn, &found) || findInReExportSiblings(image, symbol, &foundIn, &found);
+			if ( !resolved && classExport && ((strncmp(symbol, "_OBJC_CLASS_$_", 14) == 0) || (strncmp(symbol, "_OBJC_METACLASS_$_", 18) == 0)) ) {
+				// Only until objc has registered: later the target class may be realized already, and a cache image's uses must not move under it
+				if ( findClassInOtherStandIns(image, symbol, &foundIn, &found) ) {
+					if ( sNotifyObjCMapped == nullptr ) {
+						resolved = true;
+						if ( gLogCachePolicy )
+							dyld::log("dyld: objc class %s of %s is defined by %s, not by its stand-in\n", symbol, installPath, foundIn->getPath());
+					}
+					else if ( !sClassRedirectLateReported ) {
+						sClassRedirectLateReported = true;
+						dyld::log("dyld: objc class %s of %s keeps the cache's class: another stand-in defines it, but the objc runtime is registered, and a class is only redirected during the launch pass\n", symbol, installPath);
+					}
+				}
+			}
+			if ( resolved ) {
 				const bool foundInIsArm64e = dyld3::darling::cpusubtypeIsArm64e(foundIn->machHeader()->cpusubtype);
 				// an arm64e runtime never realizes the classes of a plain image, so cache code would get an unsigned class pointer
 				if ( classExport && !foundInIsArm64e ) {

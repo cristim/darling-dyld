@@ -116,13 +116,13 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
           uint64_t address = 0;
           if (wasApplied && patchClients == 0) break;
           const bool found = resolve(name, classNames.count(name) != 0, &address);
-          if (found) lastAddress[name] = address;
+          if (found) { lastAddress[name] = address; byIndex[index][name] = address; }
           if (!wasApplied) { ++s->exports; s->slots += 2; if (found) s->patched += 2; else { ++s->missingExports; s->missingSlots += 2; } }
           s->plainSlots += patchClients; (found ? s->plainPatched : s->plainMissing) += patchClients;
         }
         return nullptr;
       }
-      std::vector<std::string> moreNames; mutable std::map<std::string, uint64_t> lastAddress; mutable std::map<uint32_t, uint64_t> thunk; mutable std::vector<bool> logOn, actionNull; mutable std::vector<uint64_t> patchedClients; std::set<std::string> classNames;   // the symbols the cache has as kind 8 exports
+      std::vector<std::string> moreNames; mutable std::map<std::string, uint64_t> lastAddress; mutable std::map<uint32_t, std::map<std::string, uint64_t>> byIndex; mutable std::map<uint32_t, uint64_t> thunk; mutable std::vector<bool> logOn, actionNull; mutable std::vector<uint64_t> patchedClients; std::set<std::string> classNames;   // the symbols the cache has as kind 8 exports
     };
     struct ImageLoader {
       struct LinkContext { bool verboseMapping = false; bool linkingMainExecutable = false; };
@@ -155,6 +155,7 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
       #{record_struct}
       ImageLoader::LinkContext gLinkContext; bool gLogCachePolicy = false;
       dyld3::SharedCacheLoadInfo sSharedCacheLoadInfo = {nullptr};
+      void *sNotifyObjCMapped = nullptr;                     // objc's mapped notifier: null until the runtime registers
       std::vector<ImageLoader*> sAllImages;
       std::vector<DiskOverrideOfCacheImage> sDiskOverridesOfCacheImages;
       std::vector<std::string> logged;
@@ -187,7 +188,7 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
     }
     // a disk image standing in for cache image `index`, as loadPhase5 records it
     static void shadow(const char *install, uint32_t index) { ImageLoader *i = image(install); sAllImages.push_back(i); sDiskOverridesOfCacheImages.push_back({i, index}); }
-    static void reset(DyldSharedCache &cache) { sAllImages.clear(); sDiskOverridesOfCacheImages.clear(); cache.calls.clear(); cache.applied.clear(); sCacheImagesSeen.clear(); cache.lastAddress.clear(); cache.logOn.clear(); cache.actionNull.clear(); cache.patchedClients.clear(); cache.thunk.clear(); sCacheImagesSeen.clear(); cache.classNames.clear(); cache.moreNames.clear(); cache.error = nullptr; cache.patchInfo = true; logged.clear(); }
+    static void reset(DyldSharedCache &cache) { sAllImages.clear(); sDiskOverridesOfCacheImages.clear(); cache.calls.clear(); cache.applied.clear(); sCacheImagesSeen.clear(); cache.lastAddress.clear(); cache.byIndex.clear(); sNotifyObjCMapped = nullptr; sClassRedirectLateReported = false; sClassConflictsCount = 0; cache.logOn.clear(); cache.actionNull.clear(); cache.patchedClients.clear(); cache.thunk.clear(); sCacheImagesSeen.clear(); cache.classNames.clear(); cache.moreNames.clear(); cache.error = nullptr; cache.patchInfo = true; logged.clear(); }
     static unsigned summaries() { unsigned n = 0; for (const std::string &l : logged) n += l.find("split cache GOT override: patched=") != std::string::npos; return n; }
 
     int main() {
@@ -454,6 +455,74 @@ Dir.mktmpdir('patch-info-v4-wiring-') do |dir|
       overrideSplitCacheGotSlots();
       CHECK((cache.logOn == std::vector<bool>{true}));
       gLogCachePolicy = false;
+
+      // --- a class that Darling keeps in another framework than Apple does: the stand-in of its image lacks it, the stand-in of another cache image defines it ---
+      {
+        static uintptr_t kept[8];
+        const char *K = "_OBJC_CLASS_$_Kept";   // reassigned for the metaclass case
+        // standIn (cache image 1, arm64e) lacks the class. Each owner is {install path, cpu subtype, recorded as a stand-in, in the cache}.
+        struct Owner { const char *install; int subtype; bool standInRecord; bool inCache; uintptr_t address; };
+        auto run = [&](std::vector<Owner> owners, bool standInAlso = false, bool kind8 = true, bool registered = false) {
+          reset(cache); sNotifyObjCMapped = registered ? (void *)1 : nullptr;
+          sAllImages.push_back(image("/usr/lib/libz.1.dylib", true));
+          for (const Owner &o : owners) {
+            ImageLoader *i = image(o.install); i->header.cpusubtype = o.subtype; i->inCache = o.inCache; i->exports = {{K, o.address}};
+            sAllImages.push_back(i); if (o.standInRecord) sDiskOverridesOfCacheImages.push_back({i, 3});
+          }
+          ImageLoader *standIn = image("/usr/lib/system/libsystem_kernel.dylib"); standIn->header.cpusubtype = 2; if (standInAlso) standIn->exports[K] = (uintptr_t)&kept[7];
+          cache.moreNames = {K}; if (kind8) cache.classNames = {K};
+          sAllImages.push_back(standIn); sDiskOverridesOfCacheImages.insert(sDiskOverridesOfCacheImages.begin(), {standIn, 1});
+          overrideSplitCacheGotSlots();
+        };
+        const uintptr_t A = (uintptr_t)&kept[0], B = (uintptr_t)&kept[1];
+        auto redirected = [&]() { return cache.byIndex[1].count(K) ? cache.byIndex[1][K] : 0; };
+        auto lines = [&](const char *needle) { unsigned n = 0; for (const std::string &l : logged) n += l.find(needle) != std::string::npos; return n; };
+        gLogCachePolicy = true;
+        run({{"/usr/lib/system/libsystem_c.dylib", 2, true, false, A}});
+        CHECK(redirected() == A);                                                    // another stand-in's definition
+        CHECK(lines("dyld: objc class _OBJC_CLASS_$_Kept of /usr/lib/system/libsystem_kernel.dylib is defined by /prefix/usr/lib/system/libsystem_c.dylib, not by its stand-in") == 1);
+        K = "_OBJC_METACLASS_$_Kept"; run({{"/usr/lib/system/libsystem_c.dylib", 2, true, false, A}});
+        CHECK(redirected() == A);                                                    // the metaclass export goes with its class
+        K = "_OBJC_CLASS_$_Kept";
+        run({{"/usr/lib/system/libsystem_c.dylib", 2, true, false, A}}, true);        // the stand-in's own definition wins, as for every other symbol
+        CHECK(redirected() == (uintptr_t)&kept[7] && lines("not by its stand-in") == 0);
+        run({{"/usr/lib/system/libsystem_c.dylib", 2, false, false, A}});             // a loaded image that is no stand-in (the main program, a bundled framework, an inserted library) never counts
+        CHECK(redirected() == 0 && lines("objc class") == 0);
+        run({{"/usr/lib/system/libsystem_c.dylib", 1, true, false, A}});              // a plain image's class is refused (the arm64e runtime cannot realize it): the cache keeps its own
+        CHECK(redirected() == 0 && lines("class export of a non-arm64e image") == 1);
+        // two definers: the first arm64e one in load order, however the plain ones sit around it, and the conflict named once
+        run({{"/usr/lib/system/libsystem_c.dylib", 1, true, false, B}, {"/usr/lib/system/libsystem_info.dylib", 2, true, false, A}});
+        CHECK(redirected() == A && lines("is defined by") == 1 && lines("and by") == 0);   // a plain first match does not shadow a later arm64e definer
+        run({{"/usr/lib/system/libsystem_c.dylib", 2, true, false, A}, {"/usr/lib/system/libsystem_info.dylib", 2, true, false, B}});
+        CHECK(redirected() == A && lines("is defined by /prefix/usr/lib/system/libsystem_c.dylib and by /prefix/usr/lib/system/libsystem_info.dylib, the first in load order is used") == 1);
+        cache.applied.clear(); sCacheImagesSeen.clear(); logged.clear(); overrideSplitCacheGotSlots();
+        CHECK(lines("and by") == 0);                                                   // once, not per pass
+        run({{"/usr/lib/system/libsystem_info.dylib", 2, true, false, B}, {"/usr/lib/system/libsystem_c.dylib", 2, true, false, A}});
+        CHECK(redirected() == B);                                                     // the order of loading decides, nothing else
+        // after the runtime registered a class is not moved: said once, loudly (not only under the policy option)
+        gLogCachePolicy = false;
+        run({{"/usr/lib/system/libsystem_c.dylib", 2, true, false, A}}, false, true, true);
+        CHECK(redirected() == 0 && lines("keeps the cache's class: another stand-in defines it") == 1);
+        cache.applied.clear(); sCacheImagesSeen.clear(); logged.clear(); overrideSplitCacheGotSlots();
+        CHECK(lines("keeps the cache's class") == 0);
+        // a class that no other stand-in defines says nothing, before or after
+        reset(cache); sNotifyObjCMapped = (void *)1; cache.moreNames = {"_OBJC_CLASS_$_Nowhere"}; cache.classNames = {"_OBJC_CLASS_$_Nowhere"};
+        sAllImages.push_back(image("/usr/lib/libz.1.dylib", true)); shadow("/usr/lib/system/libsystem_kernel.dylib", 1); sAllImages.back()->header.cpusubtype = 2;
+        overrideSplitCacheGotSlots();
+        CHECK(logged.empty());
+        // not a class: a kind 8 export that is no objc class, and an objc name the cache does not list as kind 8
+        gLogCachePolicy = true;
+        { cache.moreNames.clear(); }
+        reset(cache); sAllImages.push_back(image("/usr/lib/libz.1.dylib", true));
+        { ImageLoader *o = image("/usr/lib/system/libsystem_c.dylib"); o->header.cpusubtype = 2; o->exports = {{"_only_in_owner", A}}; sAllImages.push_back(o); sDiskOverridesOfCacheImages.push_back({o, 3}); }
+        { ImageLoader *st = image("/usr/lib/system/libsystem_kernel.dylib"); st->header.cpusubtype = 2; sAllImages.push_back(st); sDiskOverridesOfCacheImages.insert(sDiskOverridesOfCacheImages.begin(), {st, 1}); }
+        cache.moreNames = {"_only_in_owner"}; cache.classNames = {"_only_in_owner"};
+        overrideSplitCacheGotSlots();
+        CHECK(cache.byIndex[1].count("_only_in_owner") == 0);
+        run({{"/usr/lib/system/libsystem_c.dylib", 2, true, false, A}}, false, false);
+        CHECK(redirected() == 0);
+        gLogCachePolicy = false;
+      }
 
       // --- a reader error halts, naming the exporter and the reason ---
       reset(cache);
