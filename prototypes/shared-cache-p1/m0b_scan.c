@@ -47,6 +47,7 @@ static int nmaps;
 static struct image *imgs;
 static uint32_t nimgs;
 static uint32_t *by_text; // image indices sorted by text_addr
+static FILE *depf;        // when set, load_image writes "path<TAB>dep<TAB>dep..." per image (dependency edges)
 
 static void die(const char *m) { fprintf(stderr, "m0b: %s (errno=%d %s)\n", m, errno, strerror(errno)); exit(1); }
 static uint32_t rd32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
@@ -144,8 +145,14 @@ static void load_image(struct image *im)
     uint32_t ncmds = rd32(hdr + 16), sizeofcmds = rd32(hdr + 20);
     if (rd32(hdr) != 0xfeedfacf || 32 + sizeofcmds > n) die("bad image header");
     const uint8_t *c = hdr + 32;
+    if (depf) fprintf(depf, "%s", im->path);
     for (uint32_t i = 0; i < ncmds; i++, c += rd32(c + 4)) {
-        if (rd32(c) != 0x19) continue;
+        uint32_t cmd = rd32(c);
+        if (depf && (cmd == 0xc || cmd == 0x8000001f || cmd == 0x80000018 || cmd == 0x80000023)) {
+            uint32_t no = rd32(c + 8);
+            if (no < rd32(c + 4)) fprintf(depf, "\t%s", (const char *)(c + no));
+        }
+        if (cmd != 0x19) continue;
         const struct mach_seg *s = (const struct mach_seg *)c;
         if (strcmp(s->segname, "__TEXT")) continue;
         im->text_addr = s->vmaddr;
@@ -153,8 +160,8 @@ static void load_image(struct image *im)
         const struct mach_sect *sec = (const struct mach_sect *)(c + sizeof *s);
         for (uint32_t k = 0; k < s->nsects && im->nsec < MAX_SECS; k++)
             if (sec[k].flags & 0x80000400u) im->secs[im->nsec++] = (struct sec){sec[k].addr, sec[k].size};
-        break;
     }
+    if (depf) fprintf(depf, "\n");
 }
 
 // island resolution: returns the image index reached from island address t, or -1; sets *kind
@@ -209,6 +216,7 @@ int main(int argc, char **argv)
     uint8_t *itab = malloc((size_t)nimgs * 32);
     pread_all(files[mi].fd, ioff, itab, (size_t)nimgs * 32);
     const char *index_path = getenv("M0B_INDEX");
+    if (getenv("M0B_DEPS") && !(index_path && access(index_path, R_OK) == 0)) depf = fopen(getenv("M0B_DEPS"), "w");
     FILE *xf = index_path ? fopen(index_path, "r") : NULL;
     if (xf) {
         // cached index (addresses, __TEXT extent, code sections, install name): no scattered header reads
@@ -243,6 +251,7 @@ int main(int argc, char **argv)
         load_image(&imgs[i]);
         by_text[i] = i;
     }
+    if (depf) fclose(depf);
     if (index_path && !xf) {
         FILE *wf = fopen(index_path, "w");
         if (!wf) die("write index");
