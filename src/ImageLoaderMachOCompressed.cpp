@@ -1731,8 +1731,10 @@ bool ImageLoaderMachOCompressed::incrementCoalIterator(CoalIterator& it)
 				it.symbolName = (char*)p;
 				it.weakSymbol = ((immediate & BIND_SYMBOL_FLAGS_NON_WEAK_DEFINITION) == 0);
 				it.symbolMatches = false;
-				while (*p != '\0')
+				while ( (p < end) && (*p != '\0') )
 					++p;
+				if ( p == end )
+					dyld::throwf("malformed weak binding opcodes: symbol name extends past end of opcodes");
 				++p;
 				it.curIndex = p - start;
 				return false;

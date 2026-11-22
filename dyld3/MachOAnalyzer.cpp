@@ -1983,8 +1983,13 @@ void MachOAnalyzer::forEachBind(Diagnostics& diag,
                 case BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM:
                     weakImport = ( (immediate & BIND_SYMBOL_FLAGS_WEAK_IMPORT) != 0 );
                     symbolName = (char*)p;
-                    while (*p != '\0')
+                    while ( (p < end) && (*p != '\0') )
                         ++p;
+                    if ( p == end ) {
+                        diag.error("malformed binding opcodes: symbol name extends past end of opcodes");
+                        stop = true;
+                        break;
+                    }
                     ++p;
                     break;
                 case BIND_OPCODE_SET_TYPE_IMM:
@@ -2080,8 +2085,13 @@ void MachOAnalyzer::forEachBind(Diagnostics& diag,
                     case BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM:
                         weakImport = ( (immediate & BIND_SYMBOL_FLAGS_WEAK_IMPORT) != 0 );
                         symbolName = (char*)p;
-                        while (*p != '\0')
+                        while ( (p < end) && (*p != '\0') )
                             ++p;
+                        if ( p == end ) {
+                            diag.error("malformed binding opcodes: symbol name extends past end of opcodes");
+                            stop = true;
+                            break;
+                        }
                         ++p;
                         break;
                     case BIND_OPCODE_SET_ADDEND_SLEB:
@@ -2145,8 +2155,13 @@ void MachOAnalyzer::forEachBind(Diagnostics& diag,
                     case BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM:
                         weakImport = ( (immediate & BIND_SYMBOL_FLAGS_WEAK_IMPORT) != 0 );
                         symbolName = (char*)p;
-                        while (*p != '\0')
+                        while ( (p < end) && (*p != '\0') )
                             ++p;
+                        if ( p == end ) {
+                            diag.error("malformed binding opcodes: symbol name extends past end of opcodes");
+                            stop = true;
+                            break;
+                        }
                         ++p;
                         if ( immediate & BIND_SYMBOL_FLAGS_NON_WEAK_DEFINITION ) {
                             strongHandler(symbolName);
@@ -2621,8 +2636,13 @@ void MachOAnalyzer::parseOrgArm64eChainedFixups(Diagnostics& diag, void (^target
                 case BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM:
                     weakImport = ( (immediate & BIND_SYMBOL_FLAGS_WEAK_IMPORT) != 0 );
                     symbolName = (char*)p;
-                    while (*p != '\0')
+                    while ( (p < end) && (*p != '\0') )
                         ++p;
+                    if ( p == end ) {
+                        diag.error("malformed binding opcodes: symbol name extends past end of opcodes");
+                        stop = true;
+                        break;
+                    }
                     ++p;
                     break;
                 case BIND_OPCODE_SET_TYPE_IMM:
